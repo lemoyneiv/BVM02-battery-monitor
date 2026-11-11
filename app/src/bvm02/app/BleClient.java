@@ -130,12 +130,9 @@ public final class BleClient {
 
     private BluetoothManager btManager;
     private BluetoothAdapter btAdapter;
-    private final BroadcomGattEnabler brcmEnabler;
 
     // BLE / Dual-Mode Scanner state
-    private final AtomicInteger scanGeneration = new AtomicInteger(0);
     private boolean isScanning = false;
-    private boolean scanAwaitingGattEnable = false;
     private boolean usingDiscoveryFallback = false;
     private boolean discoveryReceiverRegistered = false;
     private final Map<String, ScannedDevice> scannedMap = new LinkedHashMap<String, ScannedDevice>();
@@ -166,7 +163,6 @@ public final class BleClient {
     public BleClient(Context context, Listener listener) {
         this.appContext = context.getApplicationContext();
         this.listener = listener;
-        this.brcmEnabler = new BroadcomGattEnabler(this.appContext, this.mainHandler);
         refreshAdapterReferences();
     }
 
@@ -270,7 +266,6 @@ public final class BleClient {
                 .append("  A2DP=").append(profileStateStr(a2dp))
                 .append("  Bonded=").append(bondedCount).append('\n');
         sb.append("Binder Stack: ").append(BtStackProbe.checkIBluetoothGattStatus(btAdapter)).append('\n');
-        sb.append("Broadcom BLE: ").append(brcmEnabler.buildStatusLine(btAdapter)).append('\n');
         sb.append("GATT Session: ").append(connState.name())
                 .append(activeSensor != null ? (" (" + activeSensor.mac + ")") : "")
                 .append("  |  Reads=").append(rxReadCount)
@@ -350,11 +345,6 @@ public final class BleClient {
         String upperMac = mac.toUpperCase(Locale.US);
         ScannedDevice prev = scannedMap.get(upperMac);
 
-        int brcmType = BtStackProbe.tryGetBroadcomDeviceType(device);
-        int effectiveType = (devType != BluetoothDevice.DEVICE_TYPE_UNKNOWN)
-                ? devType
-                : (brcmType >= 0 ? brcmType : BluetoothDevice.DEVICE_TYPE_UNKNOWN);
-
         String candidateName = (extraName != null && !extraName.trim().isEmpty())
                 ? extraName.trim()
                 : ((devName != null && !devName.trim().isEmpty()) ? devName.trim() : "");
@@ -368,9 +358,7 @@ public final class BleClient {
 
         boolean hasFff0 = hasUuidFff0 || (prev != null && prev.hasServiceFff0);
         boolean isMatch = Bvm02Protocol.isLikelyBvm02Device(candidateName, null) || hasFff0;
-        String metaPreview = "TYPE=" + deviceTypeStr(effectiveType)
-                + (brcmType >= 0 ? (" BRCM=" + brcmType) : "")
-                + " (Inquiry)";
+        String metaPreview = "TYPE=" + deviceTypeStr(devType) + " (Inquiry)";
 
         boolean isNew = (prev == null);
         boolean nameNewlyResolved = (prev != null && prev.name.isEmpty() && !candidateName.isEmpty());
@@ -383,7 +371,7 @@ public final class BleClient {
                 hasFff0,
                 metaPreview,
                 SystemClock.elapsedRealtime(),
-                effectiveType,
+                devType,
                 true
         );
         scannedMap.put(upperMac, entry);
@@ -393,8 +381,7 @@ public final class BleClient {
                     + "name='" + (candidateName.isEmpty() ? "<unnamed>" : candidateName)
                     + "' mac=" + upperMac
                     + " rssi=" + rssi + "dBm"
-                    + " type=" + deviceTypeStr(effectiveType)
-                    + (brcmType >= 0 ? (" brcmType=" + brcmType) : "")
+                    + " type=" + deviceTypeStr(devType)
                     + " bvm02Match=" + isMatch
                     + " via=" + (BluetoothDevice.ACTION_FOUND.equals(action) ? "ACTION_FOUND" : "NAME_CHANGED"));
         }
@@ -489,27 +476,19 @@ public final class BleClient {
 
                 scannedMap.clear();
                 usingDiscoveryFallback = false;
-                scanAwaitingGattEnable = false;
                 listener.onScanResultsUpdated(Collections.<ScannedDevice>emptyList());
 
-                final int sGen = scanGeneration.incrementAndGet();
                 if (BtStackProbe.getLiveIBluetoothGatt(btAdapter) == null) {
-                    isScanning = true;
-                    scanAwaitingGattEnable = true;
-                    listener.onScanStateChanged(true, "Activating Broadcom BLE / GATT service...");
-                    brcmEnabler.ensureGattReady(btAdapter, new BroadcomGattEnabler.ReadinessCallback() {
-                        @Override
-                        public void onResult(boolean gattReady, String summary) {
-                            if (scanGeneration.get() != sGen || !isScanning) {
-                                return;
-                            }
-                            scanAwaitingGattEnable = false;
-                            executeScanWithCurrentStack();
-                        }
-                    });
-                } else {
-                    executeScanWithCurrentStack();
+                    isScanning = false;
+                    DiagLogger.log("BLE_SCAN", "IBluetoothGatt is NULL ("
+                            + BtStackProbe.checkIBluetoothGattStatus(btAdapter)
+                            + "). Skipping BLE scan to keep system_server safe; open BT Diagnostics -> Probe BT Stack & Export Log.");
+                    listener.onScanStateChanged(false,
+                            "IBluetoothGatt=NULL on this firmware (Telechips BT mbox) — open BT Diagnostics -> Probe BT Stack & Export Log.");
+                    return;
                 }
+
+                executeScanWithCurrentStack();
             }
         });
     }
@@ -517,7 +496,6 @@ public final class BleClient {
     private void executeScanWithCurrentStack() {
         if (btAdapter == null || !isAdapterEnabled()) {
             isScanning = false;
-            scanAwaitingGattEnable = false;
             listener.onScanStateChanged(false, "Bluetooth is OFF — enable Bluetooth on head unit.");
             return;
         }
@@ -550,7 +528,6 @@ public final class BleClient {
 
         if (started) {
             isScanning = true;
-            scanAwaitingGattEnable = false;
             usingDiscoveryFallback = false;
             DiagLogger.log("BLE_SCAN", "Started API 19 BluetoothAdapter.startLeScan()");
             listener.onScanStateChanged(true, "Scanning BLE peripherals via startLeScan (12s)...");
@@ -559,7 +536,7 @@ public final class BleClient {
             return;
         }
 
-        // Step 3: Broadcom / Gen5W Dual-Mode Inquiry Fallback (BluetoothAdapter.startDiscovery)
+        // Step 3: Standard Public Dual-Mode Inquiry Fallback (BluetoothAdapter.startDiscovery)
         ensureDiscoveryReceiverRegistered();
         try {
             if (btAdapter.isDiscovering()) {
@@ -576,7 +553,6 @@ public final class BleClient {
 
         if (discStarted) {
             isScanning = true;
-            scanAwaitingGattEnable = false;
             usingDiscoveryFallback = true;
             DiagLogger.log("BLE_DISC", "startLeScan() unavailable -> started Dual-Mode BluetoothAdapter.startDiscovery() fallback!");
             listener.onScanStateChanged(true,
@@ -585,11 +561,10 @@ public final class BleClient {
             mainHandler.postDelayed(stopScanTimeoutRunnable, DISCOVERY_FALLBACK_DURATION_MS);
         } else {
             isScanning = false;
-            scanAwaitingGattEnable = false;
             usingDiscoveryFallback = false;
             DiagLogger.log("BLE_SCAN", "Both startLeScan() and startDiscovery() returned false!");
             listener.onScanStateChanged(false,
-                    "startLeScan & startDiscovery returned false — test Add by MAC & export BT Diagnostics log.");
+                    "startLeScan & startDiscovery returned false — export BT Diagnostics log.");
         }
     }
 
@@ -603,14 +578,12 @@ public final class BleClient {
     }
 
     private void stopScanInternal(boolean notifyUi) {
-        scanGeneration.incrementAndGet();
         mainHandler.removeCallbacks(stopScanTimeoutRunnable);
         boolean wasScanning = isScanning;
-        boolean wasAwaitingEnable = scanAwaitingGattEnable;
         boolean wasFallback = usingDiscoveryFallback;
 
         if (btAdapter != null) {
-            if (wasScanning && !wasAwaitingEnable && !wasFallback) {
+            if (wasScanning && !wasFallback) {
                 try {
                     btAdapter.stopLeScan(leScanCallback);
                     DiagLogger.log("BLE_SCAN", "Stopped API 19 startLeScan.");
@@ -631,7 +604,6 @@ public final class BleClient {
         }
 
         isScanning = false;
-        scanAwaitingGattEnable = false;
         if (notifyUi || wasScanning) {
             int bvmCount = 0;
             int leCount = 0;
@@ -712,11 +684,20 @@ public final class BleClient {
             return;
         }
 
-        // Critical on KitKat Broadcom BT: stop LE scan & cancel inquiry discovery before GATT connect
+        // Stop LE scan & cancel inquiry discovery before GATT connect
         stopScanInternal(true);
 
         // Cleanly tear down any previous GATT session & release clientIf slot
         closeGattInternal();
+
+        if (BtStackProbe.getLiveIBluetoothGatt(btAdapter) == null) {
+            DiagLogger.log("GATT_ERR", "Cannot connectGatt to " + sensor.mac
+                    + ": IBluetoothGatt is NULL on this firmware ("
+                    + BtStackProbe.checkIBluetoothGattStatus(btAdapter) + ")");
+            updateConnState(ConnState.DISCONNECTED, sensor,
+                    "IBluetoothGatt=NULL on firmware — open BT Diagnostics -> Probe BT Stack");
+            return;
+        }
 
         final BluetoothDevice remote;
         try {
@@ -735,22 +716,8 @@ public final class BleClient {
         rxAssembler.reset();
 
         final int gen = connGeneration.incrementAndGet();
-        if (BtStackProbe.getLiveIBluetoothGatt(btAdapter) == null) {
-            updateConnState(ConnState.CONNECTING, sensor,
-                    "Activating Broadcom BLE radio for " + sensor.getDisplayName() + "...");
-            brcmEnabler.ensureGattReady(btAdapter, new BroadcomGattEnabler.ReadinessCallback() {
-                @Override
-                public void onResult(boolean gattReady, String summary) {
-                    if (connGeneration.get() != gen) {
-                        return;
-                    }
-                    performConnectGatt(gen, sensor, remote);
-                }
-            });
-        } else {
-            updateConnState(ConnState.CONNECTING, sensor, "Connecting to " + sensor.getDisplayName() + "...");
-            performConnectGatt(gen, sensor, remote);
-        }
+        updateConnState(ConnState.CONNECTING, sensor, "Connecting to " + sensor.getDisplayName() + "...");
+        performConnectGatt(gen, sensor, remote);
     }
 
     private void performConnectGatt(final int gen, final SensorConfig sensor, final BluetoothDevice remote) {
@@ -768,13 +735,11 @@ public final class BleClient {
             remBond = remote.getBondState();
             remKnownName = remote.getName();
         } catch (Throwable ignored) {}
-        int remBrcmType = BtStackProbe.tryGetBroadcomDeviceType(remote);
 
         DiagLogger.log("GATT", "Calling API 19 connectGatt(autoConnect=false) to "
                 + sensor.mac + " [gen=" + gen
                 + ", name=" + (remKnownName != null ? remKnownName : "<unknown>")
                 + ", type=" + deviceTypeStr(remType)
-                + (remBrcmType >= 0 ? (", brcmType=" + remBrcmType) : "")
                 + ", bond=" + remBond + "] | "
                 + BtStackProbe.checkIBluetoothGattStatus(btAdapter));
 
@@ -789,15 +754,11 @@ public final class BleClient {
             return;
         }
 
-        if (activeGatt == null && brcmEnabler.hasCallbackGattBinder()) {
-            activeGatt = brcmEnabler.tryConstructAndConnectBluetoothGatt(appContext, remote, false, gattCb);
-        }
-
         if (activeGatt == null) {
             gattErrorCount++;
-            DiagLogger.log("GATT_ERR", "connectGatt returned null BluetoothGatt! (IBluetoothGatt binder unavailable; see BRCM_BLE & BT_PROBE logs)");
+            DiagLogger.log("GATT_ERR", "connectGatt returned null BluetoothGatt! (IBluetoothGatt binder unavailable)");
             updateConnState(ConnState.DISCONNECTED, sensor,
-                    "connectGatt returned null — export USB log to inspect GattService status");
+                    "connectGatt returned null — export USB log to inspect BT stack");
             return;
         }
 
@@ -837,7 +798,6 @@ public final class BleClient {
             stopScanInternal(false);
             unregisterDiscoveryReceiver();
             closeGattInternal();
-            brcmEnabler.releaseAll(btAdapter);
         } else {
             mainHandler.post(new Runnable() {
                 @Override
@@ -845,7 +805,6 @@ public final class BleClient {
                     stopScanInternal(false);
                     unregisterDiscoveryReceiver();
                     closeGattInternal();
-                    brcmEnabler.releaseAll(btAdapter);
                 }
             });
         }

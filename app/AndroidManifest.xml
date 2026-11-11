@@ -1,8 +1,8 @@
 <?xml version="1.0" encoding="utf-8"?>
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     package="bvm02.app"
-    android:versionCode="3"
-    android:versionName="0.1.2">
+    android:versionCode="4"
+    android:versionName="0.1.3">
 
     <uses-sdk android:minSdkVersion="19" android:targetSdkVersion="19" />
 
@@ -27,9 +27,6 @@
         android:icon="@drawable/ic_app"
         android:theme="@style/Bvm02Theme"
         android:allowBackup="false">
-
-        <!-- Link Gen5W Broadcom Bluetooth library (/system/framework/com.broadcom.bt.jar) when present -->
-        <uses-library android:name="com.broadcom.bt" android:required="false" />
 
         <!-- Prevent aspect ratio letterboxing on 24:9 (1920x720 / 2560x720) Gen5W display -->
         <meta-data android:name="android.max_aspect" android:value="4.0" />

@@ -401,7 +401,20 @@ def test_shell_scripts_and_flash_safety() -> None:
             if "OpKind.WRITE_CHAR, Bvm02Protocol.UUID_VERSION_INFO" in content:
                 fail(f"CRITICAL: Forbidden write to firmware characteristic 0xFFF1 in {src_file}")
 
-    print("  [OK] Zero internal eMMC logging, read-only 0xFFF1 safety, and UI terminology checks passed")
+    manifest_xml = (BASE_DIR / "app" / "AndroidManifest.xml").read_text(encoding="utf-8")
+    if "com.broadcom.bt" in manifest_xml:
+        fail("AndroidManifest.xml must NOT link com.broadcom.bt on Telechips mbox Gen5W firmware!")
+
+    for critical_src in [
+        BASE_DIR / "app" / "src" / "bvm02" / "app" / "BleClient.java",
+        BASE_DIR / "app" / "src" / "bvm02" / "app" / "MainActivity.java",
+    ]:
+        c_text = critical_src.read_text(encoding="utf-8")
+        for unsafe_tok in ["enableGatt", "enableRadio", "disableRadio", "BluetoothRadioManager", "BroadcomGattEnabler"]:
+            if unsafe_tok in c_text:
+                fail(f"CRITICAL Gen5W safety violation: found '{unsafe_tok}' in {critical_src}")
+
+    print("  [OK] Zero internal eMMC logging, read-only 0xFFF1, system_server mbox safety, and UI terminology checks passed")
 
 
 def main() -> None:

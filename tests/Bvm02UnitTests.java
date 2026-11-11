@@ -1,4 +1,3 @@
-import bvm02.app.BroadcomGattEnabler;
 import bvm02.app.BtStackProbe;
 import bvm02.app.Bvm02Protocol;
 import bvm02.app.ScreenshotHelper;
@@ -9,15 +8,13 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
-import java.util.ArrayList;
-import java.util.HashMap;
+import java.nio.charset.Charset;
 import java.util.List;
-import java.util.Map;
 
 /**
  * Host JVM unit test suite for BVM02 protocol framing, BLE scanRecord parsing,
  * 20-byte ATT multi-chunk reassembly, 12V/24V SoC curves, MAC validation, Telechips BGRA fix,
- * Broadcom RadioManager dynamic Proxy safety, and in-RAM Dalvik DEX / ODEX introspection.
+ * passive ELF32 .dynsym / DT_NEEDED symbol parsing, and in-RAM Dalvik DEX / ODEX introspection.
  */
 public final class Bvm02UnitTests {
 
@@ -54,7 +51,7 @@ public final class Bvm02UnitTests {
         testPiecewiseSocAndHealthCurve();
         testSensorConfigValidation();
         testTelechipsBgraSwapDetector();
-        testBroadcomProxyAndMacRedaction();
+        testElf32SymbolParserAndMacRedaction();
         testInRamDexInventoryParser(args.length > 0 ? args[0] : "build/dex/classes.dex");
 
         System.out.println("  [OK] Bvm02UnitTests passed all " + passed + " assertions.");
@@ -314,26 +311,28 @@ public final class Bvm02UnitTests {
         byte[] dexBytes = bos.toByteArray();
 
         List<BtStackProbe.DexClassEntry> classes = BtStackProbe.extractDexInventory(dexBytes);
-        assertTrue("extracted >= 9 app classes from classes.dex", classes.size() >= 9);
+        assertTrue("extracted >= 8 app classes from classes.dex", classes.size() >= 8);
 
         BtStackProbe.DexClassEntry protoCls = null;
         BtStackProbe.DexClassEntry probeCls = null;
-        BtStackProbe.DexClassEntry enablerCls = null;
+        BtStackProbe.DexClassEntry bleClientCls = null;
         for (int i = 0; i < classes.size(); i++) {
             BtStackProbe.DexClassEntry ce = classes.get(i);
             if ("bvm02.app.Bvm02Protocol".equals(ce.className)) protoCls = ce;
             if ("bvm02.app.BtStackProbe".equals(ce.className)) probeCls = ce;
-            if ("bvm02.app.BroadcomGattEnabler".equals(ce.className)) enablerCls = ce;
+            if ("bvm02.app.BleClient".equals(ce.className)) bleClientCls = ce;
+            assertTrue("BroadcomGattEnabler absent from classes.dex",
+                    !"bvm02.app.BroadcomGattEnabler".equals(ce.className));
         }
         assertTrue("found Bvm02Protocol in DEX inventory", protoCls != null);
         assertTrue("found BtStackProbe in DEX inventory", probeCls != null);
-        assertTrue("found BroadcomGattEnabler in DEX inventory", enablerCls != null);
-        assertTrue("BroadcomGattEnabler instanceFields decoded", !enablerCls.instanceFields.isEmpty());
+        assertTrue("found BleClient in DEX inventory", bleClientCls != null);
+        assertTrue("BleClient instanceFields decoded", !bleClientCls.instanceFields.isEmpty());
 
         // Verify filtered DEX extraction (used on large system JARs/ODEXes like services.jar)
         List<BtStackProbe.DexClassEntry> filtered = BtStackProbe.extractDexInventory(
-                dexBytes, new String[]{"broadcomgattenabler"});
-        assertTrue("filtered DEX inventory returns only BroadcomGattEnabler classes",
+                dexBytes, new String[]{"btstackprobe"});
+        assertTrue("filtered DEX inventory returns only BtStackProbe classes",
                 !filtered.isEmpty() && filtered.size() < classes.size());
 
         boolean foundParseVolt = false;
@@ -368,13 +367,7 @@ public final class Bvm02UnitTests {
         assertEquals("reject short buffer", 0, BtStackProbe.extractDexInventory(new byte[10]).size());
     }
 
-    public interface MockRadioCallback {
-        void onRadioStateChange(boolean enabled);
-        boolean checkFlag();
-        int getCode();
-    }
-
-    private static void testBroadcomProxyAndMacRedaction() {
+    private static void testElf32SymbolParserAndMacRedaction() {
         // 1. Verify MAC redaction for both colon-delimited and contiguous 12-hex btaddr properties
         assertEqualsStr("redact colon MAC",
                 "Adapter [00:92:A5:**:**:**]",
@@ -386,31 +379,114 @@ public final class Bvm02UnitTests {
                 "[ro.build.host]: [cbcd-deploy-050709073412]",
                 BtStackProbe.redactMacOctets("[ro.build.host]: [cbcd-deploy-050709073412]"));
 
-        // 2. Verify BroadcomGattEnabler dynamic Proxy Object identity semantics in ArrayList & HashMap
-        ClassLoader cl = Bvm02UnitTests.class.getClassLoader();
-        MockRadioCallback p1 = (MockRadioCallback) BroadcomGattEnabler.createDetachedCallbackProxy(
-                cl, MockRadioCallback.class, "TestRadioCb");
-        MockRadioCallback p2 = (MockRadioCallback) BroadcomGattEnabler.createDetachedCallbackProxy(
-                cl, MockRadioCallback.class, "TestRadioCb");
+        // 2. Synthesize a valid minimal 32-bit ARM (EM_ARM=40) little-endian ELF shared object
+        //    Layout:
+        //      [0..51]     Elf32_Ehdr (52B)
+        //      [64..159]   .dynstr    (SHT_STRTAB=3)
+        //      [160..191]  .dynamic   (SHT_DYNAMIC=6: DT_NEEDED x2 + DT_NULL)
+        //      [192..255]  .dynsym    (SHT_DYNSYM=11: STN_UNDEF + 2 exports + 1 import)
+        //      [256..415]  Section headers (4 x 40B = 160B)
+        byte[] dynstrBytes = (
+                "\0"
+                + "libc.so\0"                  // off 1
+                + "libtcc_mbox.so\0"           // off 9
+                + "tcc_bt_client_init\0"       // off 24
+                + "tcc_bt_gatt_scan_start\0"   // off 43
+                + "ioctl\0"                    // off 66
+        ).getBytes(Charset.forName("UTF-8"));
 
-        assertTrue("proxy equals self", p1.equals(p1));
-        assertTrue("proxy not equal to distinct proxy", !p1.equals(p2));
-        assertTrue("proxy not equal to null", !p1.equals(null));
-        assertTrue("proxy toString contains label", p1.toString().startsWith("TestRadioCb@"));
+        byte[] elf = new byte[432];
+        ByteBuffer b = ByteBuffer.wrap(elf).order(ByteOrder.LITTLE_ENDIAN);
+        elf[0] = 0x7F;
+        elf[1] = 'E';
+        elf[2] = 'L';
+        elf[3] = 'F';
+        elf[4] = 1; // ELFCLASS32
+        elf[5] = 1; // ELFDATA2LSB
+        elf[6] = 1; // EV_CURRENT
+        b.putShort(16, (short) 3);   // ET_DYN
+        b.putShort(18, (short) 40);  // EM_ARM
+        b.putInt(20, 1);             // e_version
+        b.putInt(32, 256);           // e_shoff
+        b.putShort(40, (short) 52);  // e_ehsize
+        b.putShort(46, (short) 40);  // e_shentsize
+        b.putShort(48, (short) 4);   // e_shnum
 
-        List<MockRadioCallback> list = new ArrayList<MockRadioCallback>();
-        list.add(p1);
-        assertTrue("ArrayList contains p1", list.contains(p1));
-        assertTrue("ArrayList does not contain p2", !list.contains(p2));
+        // Copy .dynstr at 64
+        System.arraycopy(dynstrBytes, 0, elf, 64, dynstrBytes.length);
 
-        Map<MockRadioCallback, String> map = new HashMap<MockRadioCallback, String>();
-        map.put(p1, "BLE");
-        assertEqualsStr("HashMap lookup p1", "BLE", map.get(p1));
-        assertTrue("HashMap lookup p2 is null", map.get(p2) == null);
+        // .dynamic at 160 (3 entries x 8B = 24B)
+        b.putInt(160, 1); b.putInt(164, 1);  // DT_NEEDED -> "libc.so"
+        b.putInt(168, 1); b.putInt(172, 9);  // DT_NEEDED -> "libtcc_mbox.so"
+        b.putInt(176, 0); b.putInt(180, 0);  // DT_NULL
 
-        // Primitive return safety (never throws NullPointerException on unboxing)
-        p1.onRadioStateChange(true);
-        assertTrue("primitive boolean default false", !p1.checkFlag());
-        assertEquals("primitive int default 0", 0, p1.getCode());
+        // .dynsym at 192 (4 entries x 16B = 64B)
+        // Entry 1 (192 + 16 = 208): exported func "tcc_bt_client_init" (shndx=1)
+        b.putInt(208, 24);
+        b.putInt(212, 0x00001200);
+        b.putInt(216, 48);
+        elf[220] = (byte) ((1 << 4) | 2); // STB_GLOBAL | STT_FUNC
+        b.putShort(222, (short) 1);
+
+        // Entry 2 (192 + 32 = 224): exported func "tcc_bt_gatt_scan_start" (shndx=1)
+        b.putInt(224, 43);
+        b.putInt(228, 0x00001400);
+        b.putInt(232, 64);
+        elf[236] = (byte) ((1 << 4) | 2); // STB_GLOBAL | STT_FUNC
+        b.putShort(238, (short) 1);
+
+        // Entry 3 (192 + 48 = 240): imported func "ioctl" (shndx=0 SHN_UNDEF)
+        b.putInt(240, 66);
+        b.putInt(244, 0);
+        b.putInt(248, 0);
+        elf[252] = (byte) ((1 << 4) | 2);
+        b.putShort(254, (short) 0);
+
+        // Section headers at 256 (4 x 40B):
+        // [0] SHT_NULL (all zeros)
+        // [1] .dynstr (index 1): sh_type=3 (SHT_STRTAB), sh_offset=64, sh_size=dynstrBytes.length
+        int sh1 = 256 + 40;
+        b.putInt(sh1 + 4, 3);
+        b.putInt(sh1 + 16, 64);
+        b.putInt(sh1 + 20, dynstrBytes.length);
+
+        // [2] .dynamic (index 2): sh_type=6 (SHT_DYNAMIC), sh_offset=160, sh_size=24, sh_link=1, sh_entsize=8
+        int sh2 = 256 + 80;
+        b.putInt(sh2 + 4, 6);
+        b.putInt(sh2 + 16, 160);
+        b.putInt(sh2 + 20, 24);
+        b.putInt(sh2 + 24, 1);
+        b.putInt(sh2 + 36, 8);
+
+        // [3] .dynsym (index 3): sh_type=11 (SHT_DYNSYM), sh_offset=192, sh_size=64, sh_link=1, sh_entsize=16
+        int sh3 = 256 + 120;
+        b.putInt(sh3 + 4, 11);
+        b.putInt(sh3 + 16, 192);
+        b.putInt(sh3 + 20, 64);
+        b.putInt(sh3 + 24, 1);
+        b.putInt(sh3 + 36, 16);
+
+        BtStackProbe.Elf32Info info = BtStackProbe.extractElf32Info(elf);
+        assertTrue("ELF32 info non-null", info != null);
+        assertEquals("ELF32 machine EM_ARM=40", 40, info.machine);
+        assertEquals("DT_NEEDED count", 2, info.neededLibs.size());
+        assertEqualsStr("DT_NEEDED[0]", "libc.so", info.neededLibs.get(0));
+        assertEqualsStr("DT_NEEDED[1]", "libtcc_mbox.so", info.neededLibs.get(1));
+
+        List<String> exports = BtStackProbe.extractElf32DynamicSymbols(elf);
+        assertEquals("exported symbol count", 2, exports.size());
+        assertEqualsStr("export[0]", "tcc_bt_client_init", exports.get(0));
+        assertEqualsStr("export[1]", "tcc_bt_gatt_scan_start", exports.get(1));
+
+        assertEquals("imported symbol count", 1, info.importedSymbols.size());
+        assertEqualsStr("import[0]", "ioctl", info.importedSymbols.get(0));
+
+        // 3. Reject malformed / non-ELF32 buffers safely without throwing
+        assertTrue("null ELF returns null", BtStackProbe.extractElf32Info(null) == null);
+        assertTrue("short ELF returns null", BtStackProbe.extractElf32Info(new byte[16]) == null);
+        byte[] elf64 = elf.clone();
+        elf64[4] = 2; // ELFCLASS64
+        assertTrue("ELF64 rejected cleanly", BtStackProbe.extractElf32Info(elf64) == null);
+        assertEquals("short ELF dynamic symbols empty", 0, BtStackProbe.extractElf32DynamicSymbols(new byte[8]).size());
     }
 }

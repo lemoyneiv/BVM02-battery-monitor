@@ -189,9 +189,7 @@ public class MainActivity extends Activity implements BleClient.Listener, DiagLo
         refreshDiagnosticsPanel();
         switchTab(TAB_MONITOR);
 
-        // Run read-only Gen5W Bluetooth & Broadcom DEX stack probe in background on startup
-        triggerAsyncBtStackProbe();
-
+        // Passive stack probe runs only when explicitly triggered via "Probe BT Stack" on BT Diagnostics tab
         // Auto-connect to active saved sensor slot on launch if configured
         SensorConfig initialSensor = sensorStore.getSlot(sensorStore.getActiveSlot());
         if (initialSensor.isConfigured()) {

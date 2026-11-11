@@ -3,6 +3,8 @@ import bvm02.app.Bvm02Protocol;
 import bvm02.app.HmgapidClient;
 import bvm02.app.ScreenshotHelper;
 import bvm02.app.SensorConfig;
+import bvm02.hook.BtMemInspector;
+import bvm02.hook.Thumb2GetterSim;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -10,12 +12,15 @@ import java.io.FileInputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.charset.Charset;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Host JVM unit test suite for BVM02 protocol framing, BLE scanRecord parsing,
  * 20-byte ATT multi-chunk reassembly, 12V/24V SoC curves, MAC validation, Telechips BGRA fix,
- * passive ELF32 .dynsym / DT_NEEDED / PT_LOAD parsing, hmgapid log slicing, and in-RAM DEX introspection.
+ * passive ELF32 .dynsym / DT_NEEDED / PT_LOAD parsing, Thumb-2 read-only getter simulation,
+ * LMP/HCI LE capability decoding, hmgapid log slicing, and in-RAM DEX introspection.
  */
 public final class Bvm02UnitTests {
 
@@ -54,6 +59,7 @@ public final class Bvm02UnitTests {
         testTelechipsBgraSwapDetector();
         testElf32SymbolParserAndMacRedaction();
         testHmgapidLogSlicing();
+        testThumb2GetterSimAndCapabilitiesDecoder();
         testInRamDexInventoryParser(args.length > 0 ? args[0] : "build/dex/classes.dex");
 
         System.out.println("  [OK] Bvm02UnitTests passed all " + passed + " assertions.");
@@ -580,5 +586,123 @@ public final class Bvm02UnitTests {
         assertTrue("latest slice starts with ts=1005", latest.startsWith(begin + " (ts=1005)"));
         assertTrue("latest slice includes bplus.default.so", latest.contains("bplus.default.so"));
         assertTrue("latest slice omits ts=1000", !latest.contains("ts=1000"));
+    }
+
+    private static void testThumb2GetterSimAndCapabilitiesDecoder() {
+        // 1. Verify ARMv7-M/A ThumbExpandImm against real bplus.default.so encoding (05 f5 12 54 -> #9344 = 0x2480)
+        assertEquals("ThumbExpandImm(1, 5, 0x12) == 9344", 0x2480,
+                (int) Thumb2GetterSim.thumbExpandImm(1, 5, 0x12));
+        assertEquals("ThumbExpandImm unrotated 0x42", 0x42,
+                (int) Thumb2GetterSim.thumbExpandImm(0, 0, 0x42));
+        assertEquals("ThumbExpandImm splat16 0x00AA00AA", 0x00AA00AA,
+                (int) Thumb2GetterSim.thumbExpandImm(0, 1, 0xAA));
+        assertEquals("ThumbExpandImm splat32 0x55555555", 0x55555555,
+                (int) Thumb2GetterSim.thumbExpandImm(0, 3, 0x55));
+
+        final Map<Long, byte[]> pages = new HashMap<Long, byte[]>();
+        Thumb2GetterSim.MemReader sparseMem = new Thumb2GetterSim.MemReader() {
+            @Override
+            public byte[] read(long addr, int len) {
+                for (Map.Entry<Long, byte[]> e : pages.entrySet()) {
+                    long base = e.getKey().longValue();
+                    byte[] data = e.getValue();
+                    if (addr >= base && addr + len <= base + data.length) {
+                        int off = (int) (addr - base);
+                        byte[] slice = new byte[len];
+                        System.arraycopy(data, off, slice, 0, len);
+                        return slice;
+                    }
+                }
+                return null;
+            }
+        };
+
+        // 2. Simulate 12-byte PC-relative pointer getter from libbluetooth_jni.so:
+        //    01 4b (ldr r3,[pc,#4]) | 7b 44 (add r3,pc) | 18 68 (ldr r0,[r3,#0]) | 70 47 (bx lr) | 3e 66 02 00
+        pages.put(Long.valueOf(0x10040000L), new byte[]{
+                0x01, 0x4B, 0x7B, 0x44, 0x18, 0x68, 0x70, 0x47,
+                0x3E, 0x66, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+        });
+        // Target pointer at 0x10040006 + 0x0002663e = 0x10066644 -> 0x10051234 (LE)
+        pages.put(Long.valueOf(0x10066644L), new byte[]{0x34, 0x12, 0x05, 0x10});
+
+        Thumb2GetterSim.SimResult pcRel = Thumb2GetterSim.simulate(0x10040000L, 12, 0L, sparseMem);
+        assertTrue("PC-relative getter ok", pcRel.ok);
+        assertEquals("PC-relative getter r0", 0x10051234, (int) pcRel.r0);
+        assertEqualsStr("PC-relative stopReason", "bx_lr", pcRel.stopReason);
+
+        // 3. Simulate 24-byte PIC GOT + add.w .bss getter (BTM_ReadLocalFeatures in bplus.default.so)
+        pages.put(Long.valueOf(0x20090000L), new byte[]{
+                0x03, 0x4B,                         // ldr r3, [pc, #12] -> 0x00102d68
+                0x04, 0x4A,                         // ldr r2, [pc, #16] -> 0x00000120
+                0x7B, 0x44,                         // add r3, pc        -> 0x20192d70 (_GLOBAL_OFFSET_TABLE_)
+                (byte) 0x98, 0x58,                  // ldr r0, [r3, r2]  -> [0x20192e90] = 0x201a5000 (btm_cb)
+                0x00, (byte) 0xF5, 0x12, 0x50,      // add.w r0, r0, #0x2480
+                0x70, 0x47,                         // bx lr
+                0x00, (byte) 0xBF,                  // nop
+                0x68, 0x2D, 0x10, 0x00,             // .word 0x00102d68
+                0x20, 0x01, 0x00, 0x00              // .word 0x00000120
+        });
+        pages.put(Long.valueOf(0x20192E90L), new byte[]{0x00, 0x50, 0x1A, 0x20}); // btm_cb = 0x201a5000
+
+        Thumb2GetterSim.SimResult gotRes = Thumb2GetterSim.simulate(0x20090000L, 24, 0L, sparseMem);
+        assertTrue("PIC GOT + add.w getter ok", gotRes.ok);
+        assertEquals("PIC GOT target (btm_cb)", 0x201A5000, (int) gotRes.gotTarget);
+        assertEquals("PIC GOT + 0x2480 r0", 0x201A7480, (int) gotRes.r0);
+
+        // 4. Simulate BTM_ReadLocalVersion(&scratch) writing strictly into SCRATCH_BASE
+        pages.put(Long.valueOf(0x20091000L), new byte[]{
+                0x06, 0x21,                         // movs r1, #6 (HCI 4.0)
+                0x01, 0x70,                         // strb r1, [r0, #0]
+                0x41, (byte) 0xF2, 0x34, 0x21,      // movw r1, #0x1234
+                0x41, (byte) 0x80,                  // strh r1, [r0, #2]
+                0x06, 0x21,                         // movs r1, #6 (LMP 4.0)
+                0x01, 0x71,                         // strb r1, [r0, #4]
+                0x0F, 0x21,                         // movs r1, #15 (Broadcom 0x000F)
+                (byte) 0xC1, (byte) 0x80,           // strh r1, [r0, #6]
+                0x44, (byte) 0xF2, 0x09, 0x11,      // movw r1, #0x4109
+                0x01, (byte) 0x81,                  // strh r1, [r0, #8]
+                0x00, 0x20,                         // movs r0, #0 (BTM_SUCCESS)
+                0x70, 0x47                          // bx lr
+        });
+        Thumb2GetterSim.SimResult verRes = Thumb2GetterSim.simulate(
+                0x20091000L, 28, Thumb2GetterSim.SCRATCH_BASE, sparseMem);
+        assertTrue("BTM_ReadLocalVersion scratch sim ok", verRes.ok);
+        assertEquals("BTM_ReadLocalVersion return BTM_SUCCESS(0)", 0, (int) verRes.r0);
+        assertEquals("scratch hci_ver", 6, verRes.scratch[0] & 0xFF);
+        assertEquals("scratch hci_rev lo", 0x34, verRes.scratch[2] & 0xFF);
+        assertEquals("scratch hci_rev hi", 0x12, verRes.scratch[3] & 0xFF);
+        assertEquals("scratch mfg Broadcom(15)", 0x0F, verRes.scratch[6] & 0xFF);
+        assertEquals("scratch lmp_subver lo", 0x09, verRes.scratch[8] & 0xFF);
+        assertEquals("scratch lmp_subver hi", 0x41, verRes.scratch[9] & 0xFF);
+
+        // 5. Reject any store targeting non-scratch process memory & reject unmapped code safely
+        Thumb2GetterSim.SimResult badWrite = Thumb2GetterSim.simulate(0x20091000L, 28, 0x201A5000L, sparseMem);
+        assertTrue("store outside SCRATCH_BASE rejected", !badWrite.ok);
+        assertTrue("stopReason reports str_imm_outside_scratch",
+                badWrite.stopReason.startsWith("str_imm_outside_scratch"));
+
+        Thumb2GetterSim.SimResult unmapped = Thumb2GetterSim.simulate(0x30000000L, 24, 0L, sparseMem);
+        assertTrue("unmapped code rejected cleanly", !unmapped.ok);
+        assertEqualsStr("unmapped stopReason", "unreadable_code", unmapped.stopReason);
+
+        // 6. Verify LMP features & HCI LE supported command mask decoders
+        byte[] lmpLe = new byte[]{(byte) 0xFF, (byte) 0xFE, (byte) 0x8F, (byte) 0xFE, 0x40, 0x00, 0x02, (byte) 0x80};
+        String lmpDecoded = BtMemInspector.decodeLmpFeatures(lmpLe);
+        assertTrue("LMP LE_SUPPORTED_CONTROLLER=true", lmpDecoded.contains("LE_SUPPORTED_CONTROLLER=true"));
+        assertTrue("LMP SIMUL_LE_BR_EDR=true", lmpDecoded.contains("SIMUL_LE_BR_EDR=true"));
+
+        byte[] lmpNoLe = new byte[8];
+        assertTrue("LMP LE_SUPPORTED_CONTROLLER=false",
+                BtMemInspector.decodeLmpFeatures(lmpNoLe).contains("LE_SUPPORTED_CONTROLLER=false"));
+
+        byte[] hciCmds = new byte[64];
+        hciCmds[25] = 0x07; // LE_Set_Event_Mask, LE_Read_Buffer_Size, LE_Read_Local_Features
+        hciCmds[26] = 0x1C; // LE_Set_Scan_Params, LE_Set_Scan_Enable, LE_Create_Conn
+        String cmdsDecoded = BtMemInspector.decodeSupportedLeCommands(hciCmds);
+        assertTrue("decoded LE_Set_Scan_Params", cmdsDecoded.contains("LE_Set_Scan_Params"));
+        assertTrue("decoded LE_Set_Scan_Enable", cmdsDecoded.contains("LE_Set_Scan_Enable"));
+        assertTrue("decoded LE_Create_Conn", cmdsDecoded.contains("LE_Create_Conn"));
     }
 }

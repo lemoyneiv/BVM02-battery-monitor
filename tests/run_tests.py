@@ -25,6 +25,9 @@ BUILD_TOOLS = SDK_DIR / "build-tools" / "30.0.3"
 APK_PATH = BASE_DIR / "build" / "Bvm02Monitor.apk"
 DEX_PATH = BASE_DIR / "build" / "dex" / "classes.dex"
 CLASSES_DIR = BASE_DIR / "build" / "classes"
+HOOK_STUBS_DIR = BASE_DIR / "build" / "hook-stubs"
+HOOK_CLASSES_DIR = BASE_DIR / "build" / "hook-classes"
+HOOK_JAR_PATH = BASE_DIR / "build" / "mod" / "hooks.jar"
 DIST_DIR = BASE_DIR / "dist"
 
 
@@ -49,41 +52,32 @@ def test_clean_build() -> None:
     out = run_cmd([str(BASE_DIR / "build.sh")])
     if "BUILD SUCCESSFUL!" not in out:
         fail("build.sh did not report BUILD SUCCESSFUL!")
-    if not APK_PATH.is_file() or not DEX_PATH.is_file():
-        fail("Expected build/apk/Bvm02Monitor.apk and build/dex/classes.dex to exist")
-    print(f"  [OK] Built {APK_PATH.name} ({APK_PATH.stat().st_size:,} bytes)")
+    if not APK_PATH.is_file() or not DEX_PATH.is_file() or not HOOK_JAR_PATH.is_file():
+        fail("Expected build/Bvm02Monitor.apk, build/dex/classes.dex, and build/mod/hooks.jar to exist")
+    print(f"  [OK] Built {APK_PATH.name} ({APK_PATH.stat().st_size:,} bytes) + {HOOK_JAR_PATH.name} ({HOOK_JAR_PATH.stat().st_size:,} bytes)")
 
 
 def test_java_unit_suite() -> None:
     step("2. Host JVM Unit Tests (Bvm02UnitTests)")
     with tempfile.TemporaryDirectory() as tmp:
         test_src = BASE_DIR / "tests" / "Bvm02UnitTests.java"
-        cp_compile = f"{ANDROID_JAR}{os.pathsep}{CLASSES_DIR}"
+        cp_compile = os.pathsep.join([str(ANDROID_JAR), str(CLASSES_DIR), str(HOOK_CLASSES_DIR), str(HOOK_STUBS_DIR)])
         run_cmd(["javac", "--release", "8", "-cp", cp_compile, "-d", tmp, str(test_src)])
-        cp_run = f"{tmp}{os.pathsep}{CLASSES_DIR}{os.pathsep}{ANDROID_JAR}"
+        cp_run = os.pathsep.join([tmp, str(CLASSES_DIR), str(HOOK_CLASSES_DIR), str(HOOK_STUBS_DIR), str(ANDROID_JAR)])
         out = run_cmd(["java", "-cp", cp_run, "Bvm02UnitTests", str(DEX_PATH)])
         print(out.strip())
 
 
-def test_dex_header_and_api19_symbols() -> None:
-    step("3. Dalvik DEX 035 Header & API-19 Symbol Compatibility Audit")
-    dex_bytes = DEX_PATH.read_bytes()
+def _audit_dex_against_api19(dex_path: Path, label: str, allowed_parent_prefixes=()) -> None:
+    dex_bytes = dex_path.read_bytes()
     magic = dex_bytes[:8]
     if magic != b"dex\n035\x00":
-        fail(f"Expected Dalvik 'dex\\n035\\x00' magic for Android 4.4.2 API 19, got {magic!r}")
-    print("  [OK] DEX magic verified: dex\\n035\\x00 (Android 4.4 Dalvik compatible)")
+        fail(f"[{label}] Expected Dalvik 'dex\\n035\\x00' magic for Android 4.4.2 API 19, got {magic!r}")
+    print(f"  [OK] [{label}] DEX magic verified: dex\\n035\\x00 (Android 4.4 Dalvik compatible)")
 
-    with zipfile.ZipFile(APK_PATH, "r") as zf:
-        dex_entries = [n for n in zf.namelist() if n.endswith(".dex")]
-        if dex_entries != ["classes.dex"]:
-            fail(f"Expected single classes.dex in APK, found {dex_entries}")
-    print("  [OK] Single-DEX layout verified (no multidex)")
-
-    # Disassemble classes.dex and inspect every external class & method invoke
     dexdump = BUILD_TOOLS / "dexdump"
-    dump = run_cmd([str(dexdump), "-d", str(DEX_PATH)])
+    dump = run_cmd([str(dexdump), "-d", str(dex_path)])
 
-    # Explicitly ban post-API-19 BLE APIs that broke the vendor APK
     banned_patterns = [
         ("android/bluetooth/le/", "API 21+ android.bluetooth.le.* reference"),
         ("requestMtu", "API 21+ BluetoothGatt.requestMtu reference"),
@@ -96,18 +90,23 @@ def test_dex_header_and_api19_symbols() -> None:
     ]
     for pat, reason in banned_patterns:
         if pat in dump:
-            fail(f"Found forbidden {reason} in classes.dex!")
+            fail(f"[{label}] Found forbidden {reason}!")
 
     defined_in_dex = set(
         re.findall(r"Class descriptor\s*:\s*'L([a-zA-Z0-9_/$]+);'", dump)
     )
+    for pfx in allowed_parent_prefixes:
+        leaked = sorted(c for c in defined_in_dex if c.startswith(pfx))
+        if leaked:
+            fail(f"[{label}] Must NOT bundle parent-loader stub classes {leaked}!")
 
-    # Extract all invoked external methods: Lpkg/Class;.method:(args)ret
     invoke_re = re.compile(r"L([a-zA-Z0-9_/$]+);\.([a-zA-Z0-9_$<>]+):(\([^\)]*\)\S+)")
     external_calls = set()
     for m in invoke_re.finditer(dump):
         cls_internal, meth_name, desc = m.group(1), m.group(2), m.group(3)
         if cls_internal in defined_in_dex:
+            continue
+        if any(cls_internal.startswith(pfx) for pfx in allowed_parent_prefixes):
             continue
         external_calls.add((cls_internal, meth_name, desc))
 
@@ -118,9 +117,8 @@ def test_dex_header_and_api19_symbols() -> None:
 
     missing_classes = sorted({c for (c, _, _) in external_calls if c not in jar_classes})
     if missing_classes:
-        fail(f"classes.dex references classes absent from API-19 android.jar: {missing_classes}")
+        fail(f"[{label}] References classes absent from API-19 android.jar: {missing_classes}")
 
-    # Batch-verify method descriptors against API-19 android.jar via javap -s -p
     referenced_classes = sorted({c.replace("/", ".") for (c, _, _) in external_calls})
     class_methods, class_supers = _load_javap_hierarchy(referenced_classes, jar_classes)
 
@@ -131,12 +129,31 @@ def test_dex_header_and_api19_symbols() -> None:
             unresolved.append(f"{cls_internal}.{meth_name}:{desc}")
 
     if unresolved:
-        fail("classes.dex invokes method(s) missing from API-19 android.jar:\n  " + "\n  ".join(unresolved))
+        fail(f"[{label}] Invokes method(s) missing from API-19 android.jar:\n  " + "\n  ".join(unresolved))
 
     print(
-        f"  [OK] Verified all {len(external_calls)} external SDK method invocations across "
+        f"  [OK] [{label}] Verified all {len(external_calls)} external SDK method invocations across "
         f"{len(referenced_classes)} classes against API-19 android.jar"
     )
+
+
+def test_dex_header_and_api19_symbols() -> None:
+    step("3. Dalvik DEX 035 Header & API-19 Symbol Compatibility Audit (APK + hooks.jar)")
+    with zipfile.ZipFile(APK_PATH, "r") as zf:
+        dex_entries = [n for n in zf.namelist() if n.endswith(".dex")]
+        if dex_entries != ["classes.dex"]:
+            fail(f"Expected single classes.dex in APK, found {dex_entries}")
+    print("  [OK] APK single-DEX layout verified (no multidex)")
+    _audit_dex_against_api19(DEX_PATH, "APK classes.dex")
+
+    with zipfile.ZipFile(HOOK_JAR_PATH, "r") as hz:
+        hook_dex_entries = [n for n in hz.namelist() if n.endswith(".dex")]
+        if hook_dex_entries != ["classes.dex"]:
+            fail(f"Expected single classes.dex in hooks.jar, found {hook_dex_entries}")
+        with tempfile.TemporaryDirectory() as tmp:
+            hook_dex = Path(tmp) / "hook_classes.dex"
+            hook_dex.write_bytes(hz.read("classes.dex"))
+            _audit_dex_against_api19(hook_dex, "hooks.jar classes.dex", allowed_parent_prefixes=("hmgapi/hook/",))
 
 
 def _load_javap_hierarchy(seed_classes_dot, jar_classes):
@@ -274,6 +291,12 @@ def test_distribution_archives_and_hmg_signature() -> None:
     step("5. HMG-API & NEMESIS Distribution Archives + ECDSA Signature Verification")
     mod_meta = json.loads((BASE_DIR / "mod" / "mod.json").read_text(encoding="utf-8"))
     ver_str = mod_meta["version"]
+    hooks_cfg = mod_meta.get("hooks", {})
+    if hooks_cfg.get("jar") != "hooks.jar" or hooks_cfg.get("entry") != "bvm02.hook.BtHookEntry":
+        fail(f"Expected hooks.jar / bvm02.hook.BtHookEntry in mod.json, got {hooks_cfg}")
+    if "points" in hooks_cfg:
+        fail("v0.1.6 mod.json must NOT define hooks.points so HMG-API Live.sync can late-load cleanly!")
+
     expected_zips = [
         f"bvm02-gen5w-v{ver_str}.hmgapi.zip",
         f"bvm02-gen5w-v{ver_str}-hmgapi-usb.zip",
@@ -290,6 +313,7 @@ def test_distribution_archives_and_hmg_signature() -> None:
         names = set(zf.namelist())
         required = {
             "mod.json",
+            "hooks.jar",
             "open.sh",
             "svc/btprobe.sh",
             "svc/screenshot.sh",
@@ -402,6 +426,12 @@ def test_shell_scripts_and_flash_safety() -> None:
             if "OpKind.WRITE_CHAR, Bvm02Protocol.UUID_VERSION_INFO" in content:
                 fail(f"CRITICAL: Forbidden write to firmware characteristic 0xFFF1 in {src_file}")
 
+    for hook_src in sorted((BASE_DIR / "hook" / "src").rglob("*.java")):
+        h_text = hook_src.read_text(encoding="utf-8")
+        for tok in forbidden_java_tokens + ["FileOutputStream", "FileWriter", "pokeNative", "enableGatt", "enableRadio", "com.broadcom.bt"]:
+            if tok in h_text:
+                fail(f"Forbidden write or unsafe call '{tok}' found in read-only hook source {hook_src}")
+
     manifest_xml = (BASE_DIR / "app" / "AndroidManifest.xml").read_text(encoding="utf-8")
     if "com.broadcom.bt" in manifest_xml:
         fail("AndroidManifest.xml must NOT link com.broadcom.bt on Telechips mbox Gen5W firmware!")
@@ -415,7 +445,7 @@ def test_shell_scripts_and_flash_safety() -> None:
             if unsafe_tok in c_text:
                 fail(f"CRITICAL Gen5W safety violation: found '{unsafe_tok}' in {critical_src}")
 
-    print("  [OK] Zero internal eMMC logging, read-only 0xFFF1, system_server mbox safety, and UI terminology checks passed")
+    print("  [OK] Zero internal eMMC logging, read-only hook/0xFFF1, system_server mbox safety, and UI terminology checks passed")
 
 
 def main() -> None:

@@ -37,7 +37,7 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
 /**
- * Strictly passive, read-only, in-RAM Gen5W Bluetooth, HAL, DEX bytecode & ELF32 stack introspector (v0.1.5).
+ * Strictly passive, read-only, in-RAM Gen5W Bluetooth, HAL, DEX bytecode & ELF32 stack introspector (v0.1.6).
  *
  * SAFETY INVARIANTS (Gen5W Telechips TCC803x tcc.solution.bluetooth.mbox=1):
  *  - NEVER invokes @hide Binder IPC methods on system_server (never calls enableGatt, enableRadio,
@@ -352,7 +352,7 @@ public final class BtStackProbe {
     }
 
     private static void runProbeInternal(Context ctx) {
-        DiagLogger.log("BT_PROBE", "=== BEGIN PASSIVE GEN5W BLUETOOTH HAL, DEX & ELF32 STACK PROBE (v0.1.5) ===");
+        DiagLogger.log("BT_PROBE", "=== BEGIN PASSIVE GEN5W BLUETOOTH HAL, DEX & ELF32 STACK PROBE (v0.1.6) ===");
 
         BluetoothAdapter adapter = null;
         try {
@@ -362,7 +362,7 @@ public final class BtStackProbe {
         }
 
         // 1. Passive Binder handle status check (zero hidden Binder IPC calls)
-        DiagLogger.log("BT_PROBE", "[1/8] Adapter Binder Handles: " + checkIBluetoothGattStatus(adapter));
+        DiagLogger.log("BT_PROBE", "[1/9] Adapter Binder Handles: " + checkIBluetoothGattStatus(adapter));
         Object liveGatt = getLiveIBluetoothGatt(adapter);
         if (liveGatt != null) {
             DiagLogger.log("BT_PROBE", "  Live IBluetoothGatt binder present: " + describeBinderOwner(liveGatt));
@@ -374,22 +374,77 @@ public final class BtStackProbe {
         // 3. Installed Bluetooth packages (including GET_DISABLED_COMPONENTS) & GattService state
         probeInstalledBtPackages(ctx);
 
-        // 4. HMG-API read-only root snapshot (/proc/<bt_pid>/maps, /proc/<bt_pid>/fd, HAL dirs, init.*.rc)
+        // 4. HMG-API read-only root snapshot (/proc/<bt_pid>/maps, /proc/<bt_pid>/fd, HMG-API log, HAL dirs, init.*.rc)
         Set<String> mappedSoPaths = probeRootProcessMapsAndHal();
 
-        // 5. /system/app/Bluetooth.apk boolean config table & targeted Dalvik bytecode X-ray (Config, ProfileService, b, f, AdapterService, GattService)
+        // 5. Live @bvm02_ble hook bridge inside com.android.bluetooth (live Broadcom LMP/HCI LE capabilities & bt_hc_cbacks)
+        probeLiveBluetoothHookBridge();
+
+        // 6. /system/etc/bluetooth/bt_stack.conf + /system/app/Bluetooth.apk boolean config & Dalvik bytecode X-ray
+        probeBtStackConfFiles();
         probeBluetoothApkResourcesAndDex(ctx);
 
-        // 6. /system/framework/services.jar (.odex) BluetoothManagerService Dalvik bytecode X-ray
+        // 7. /system/framework/services.jar (.odex) BluetoothManagerService Dalvik bytecode X-ray
         probeFrameworkBtAndServicesDex();
 
-        // 7. Deep passive ELF32 multi-bucket .dynsym, hw_module_t, PT_LOAD prologues & full .rodata inspection
+        // 8. Deep passive ELF32 6-bucket .dynsym, hw_module_t, full HCI/BTM/BTU function bodies & .rodata inspection
         probeNativeBtElfLibraries(mappedSoPaths);
 
-        // 8. Unfiltered HAL directories, /dev nodes, USB sysfs, props & processes
+        // 9. Unfiltered HAL directories, /dev nodes, USB sysfs, props & processes
         probeSystemFilesAndDaemons();
 
-        DiagLogger.log("BT_PROBE", "=== END PASSIVE GEN5W BLUETOOTH HAL, DEX & ELF32 STACK PROBE (v0.1.5) ===");
+        DiagLogger.log("BT_PROBE", "=== END PASSIVE GEN5W BLUETOOTH HAL, DEX & ELF32 STACK PROBE (v0.1.6) ===");
+    }
+
+    private static void probeLiveBluetoothHookBridge() {
+        DiagLogger.log("BT_PROBE", "[5/9] Live @bvm02_ble Hook Bridge inside com.android.bluetooth:");
+        BtBleBridgeClient.BridgeResponse ping = BtBleBridgeClient.sendCommand("PING");
+        if (!ping.connected) {
+            DiagLogger.log("BT_HOOK", "  @bvm02_ble PING unavailable (" + ping.error
+                    + ") — reboot head unit if hooks.jar was newly added or updated.");
+            return;
+        }
+        for (int i = 0; i < ping.lines.size(); i++) {
+            DiagLogger.log("BT_HOOK", "  PING: " + redactMacOctets(ping.lines.get(i)));
+        }
+
+        BtBleBridgeClient.BridgeResponse caps = BtBleBridgeClient.sendCommand("CAPS");
+        if (!caps.connected) {
+            DiagLogger.log("BT_HOOK", "  @bvm02_ble CAPS err: " + caps.error);
+            return;
+        }
+        for (int i = 0; i < caps.lines.size(); i++) {
+            DiagLogger.log("BT_HOOK", "  " + redactMacOctets(caps.lines.get(i)));
+        }
+    }
+
+    private static void probeBtStackConfFiles() {
+        String[] confPaths = {
+                "/system/etc/bluetooth/bt_stack.conf",
+                "/system/etc/bluetooth/bt_did.conf",
+                "/system/etc/bluetooth/auto_pair_devlist.conf"
+        };
+        for (int i = 0; i < confPaths.length; i++) {
+            File f = new File(confPaths[i]);
+            if (!f.isFile() || !f.canRead() || f.length() <= 0 || f.length() > 65536) continue;
+            BufferedReader br = null;
+            try {
+                br = new BufferedReader(new InputStreamReader(new FileInputStream(f), UTF8));
+                String line;
+                int count = 0;
+                while ((line = br.readLine()) != null && count < 60) {
+                    String t = line.trim();
+                    if (t.isEmpty() || t.startsWith("#")) continue;
+                    DiagLogger.log("BT_CONF", "  " + f.getName() + ": " + redactMacOctets(t));
+                    count++;
+                }
+            } catch (Throwable ignored) {
+            } finally {
+                if (br != null) {
+                    try { br.close(); } catch (Throwable ignored) {}
+                }
+            }
+        }
     }
 
     private static void probeSharedLibrariesAndBinderServices(Context ctx) {
@@ -403,7 +458,7 @@ public final class BtStackProbe {
                     if (i > 0) sb.append(", ");
                     sb.append(libs[i]);
                 }
-                DiagLogger.log("BT_PROBE", "[2/8] System Shared Libraries (" + libs.length + "): " + sb);
+                DiagLogger.log("BT_PROBE", "[2/9] System Shared Libraries (" + libs.length + "): " + sb);
             }
         } catch (Throwable t) {
             DiagLogger.log("BT_PROBE", "getSystemSharedLibraryNames err: " + t.getMessage());
@@ -451,7 +506,7 @@ public final class BtStackProbe {
             int flags = PackageManager.GET_SERVICES | PackageManager.GET_DISABLED_COMPONENTS;
             List<PackageInfo> pkgs = pm.getInstalledPackages(flags);
             if (pkgs == null) return;
-            DiagLogger.log("BT_PROBE", "[3/8] Installed BT packages (with GET_DISABLED_COMPONENTS):");
+            DiagLogger.log("BT_PROBE", "[3/9] Installed BT packages (with GET_DISABLED_COMPONENTS):");
             for (int i = 0; i < pkgs.size(); i++) {
                 PackageInfo pi = pkgs.get(i);
                 if (pi == null || pi.packageName == null) continue;
@@ -497,7 +552,7 @@ public final class BtStackProbe {
     }
 
     private static Set<String> probeRootProcessMapsAndHal() {
-        DiagLogger.log("BT_PROBE", "[4/8] HMG-API read-only btprobe snapshot (/proc/<bt_pid>/maps, open fds, init.*.rc):");
+        DiagLogger.log("BT_PROBE", "[4/9] HMG-API read-only btprobe snapshot (/proc/<bt_pid>/maps, open fds, HMG-API log, init.*.rc):");
         Set<String> mappedSoPaths = new LinkedHashSet<String>();
         try {
             String out = HmgapidClient.runManualServiceAndReadLog("btprobe", 4800);
@@ -528,7 +583,7 @@ public final class BtStackProbe {
     }
 
     private static void probeBluetoothApkResourcesAndDex(Context ctx) {
-        DiagLogger.log("BT_PROBE", "[5/8] Inspecting com.android.bluetooth resources & targeted Dalvik bytecode:");
+        DiagLogger.log("BT_PROBE", "[6/9] Inspecting com.android.bluetooth resources & targeted Dalvik bytecode:");
         String btApkPath = "/system/app/Bluetooth.apk";
         try {
             PackageInfo pi = ctx.getPackageManager().getPackageInfo("com.android.bluetooth", 0);
@@ -620,7 +675,7 @@ public final class BtStackProbe {
     }
 
     private static void probeFrameworkBtAndServicesDex() {
-        DiagLogger.log("BT_PROBE", "[6/8] Passive /system/framework/services.jar (.odex) BluetoothManagerService bytecode X-ray:");
+        DiagLogger.log("BT_PROBE", "[7/9] Passive /system/framework/services.jar (.odex) BluetoothManagerService bytecode X-ray:");
 
         File servicesJar = new File("/system/framework/services.jar");
         byte[] servicesDex = loadDexOrOdexBytes(servicesJar);
@@ -663,7 +718,7 @@ public final class BtStackProbe {
     }
 
     private static void probeNativeBtElfLibraries(Set<String> mappedSoPaths) {
-        DiagLogger.log("BT_PROBE", "[7/8] Deep passive FileInputStream ELF32 multi-bucket .dynsym, hw_module_t, PT_LOAD & .rodata inspection (zero dlopen):");
+        DiagLogger.log("BT_PROBE", "[8/9] Deep passive FileInputStream ELF32 multi-bucket .dynsym, hw_module_t, PT_LOAD & .rodata inspection (zero dlopen):");
 
         Set<String> targetPaths = new LinkedHashSet<String>();
         targetPaths.add("/system/lib/libbluetooth_jni.so");
@@ -776,7 +831,9 @@ public final class BtStackProbe {
                 logFilteredSymbolList("    export[L2CAP/GKI/BTU]", info.exportedSymbols, info.exportedSymMap, true,
                         new String[]{"l2ca_", "l2c_", "gki_", "btu_", "bta_sys"}, 260, true);
                 logFilteredSymbolList("    export[HCI/VENDOR/TCC]", info.exportedSymbols, info.exportedSymMap, true,
-                        new String[]{"hci", "vendor", "userial", "upio", "tcc", "mbox", "bt_hc", "brcm"}, 220, true);
+                        new String[]{"hci", "vendor", "userial", "upio", "tcc", "mbox", "bt_hc", "brcm"}, 340, true);
+                logFilteredSymbolList("    export[CB/SOCK/UART]", info.exportedSymbols, info.exportedSymMap, true,
+                        new String[]{"_cb", "l2cb", "btsock", "vhci", "userial", "upio", "send_vsc", "dut_mode"}, 260, true);
             }
 
             logHalStructAndKeyPrologues(f.getName(), elfBytes, info);
@@ -812,42 +869,58 @@ public final class BtStackProbe {
             }
         }
 
-        String[] keySymbols = {
-                "HAL_MODULE_INFO_SYM",
-                "btif_gatt_get_interface",
-                "BTA_DmBleObserve",
-                "BTM_BleObserve",
-                "BTA_DmSetBleScanParams",
-                "BTM_BleSetScanParams",
-                "BTA_DmBleStackEnable",
-                "GATT_Register",
-                "GATT_Connect",
-                "GATT_Disconnect",
-                "GATTC_ConfigureMTU",
-                "GATTC_Discover",
-                "GATTC_Read",
-                "GATTC_Write",
+        // Complete machine-code dumps (up to 2048B in 160B chunks) of HCI, BTU, BTM & HAL entrypoints
+        String[] fullBodySymbols = {
+                "BTM_ReadLocalVersion",
+                "BTM_ReadLocalFeatures",
+                "BTM_ReadLocalExtendedFeatures",
+                "BTM_ReadLocalSupportedCommands",
+                "BTM_ReadBrcmFeatures",
+                "btm_get_hci_version",
+                "btm_get_hci_buf_size",
+                "BTM_VendorSpecificCommand",
+                "BTA_DmVendorSpecificCommand",
+                "bta_dm_vendor_spec_command",
+                "btu_hcif_send_cmd",
+                "btu_hcif_process_event",
+                "btu_task",
+                "bte_main_hci_send",
+                "btsnd_hcic_data",
+                "btsnd_hcic_disconnect",
+                "btsnd_hcic_set_event_mask",
+                "btsnd_hcic_set_event_mask_page_2",
+                "bt_hc_get_interface",
+                "bt_vendor_lib_get_interface",
+                "bluetooth__get_bluetooth_interface",
                 "L2CA_RegisterFixedChannel",
-                "L2CA_ConnectFixedChnl",
-                "L2CA_RemoveFixedChnl",
-                "L2CA_SendFixedChnlData",
-                "L2CA_SetFixedChannelTout",
                 "GKI_getbuf",
                 "GKI_freebuf",
+                "GKI_send_msg",
                 "bta_sys_sendmsg",
                 "JNI_OnLoad",
-                "_ZN7android21getBluetoothInterfaceEv",
-                "_ZN7android35register_com_android_bluetooth_gattEP7_JNIEnv",
-                "_ZN7android55register_com_android_bluetooth_btservice_AdapterServiceEP7_JNIEnv"
+                "_ZN7android21getBluetoothInterfaceEv"
         };
 
-        for (int i = 0; i < keySymbols.length; i++) {
-            ElfSym sym = info.exportedSymMap.get(keySymbols[i]);
+        for (int i = 0; i < fullBodySymbols.length; i++) {
+            ElfSym sym = info.exportedSymMap.get(fullBodySymbols[i]);
             if (sym == null) continue;
-            int dumpLen = (int) Math.min(160L, sym.stSize > 0 ? sym.stSize : 128L);
-            if (dumpLen < 32) dumpLen = (int) Math.max(sym.stSize, 32L);
-            dumpElfBytesAtVaddr(fileName, sym.name + "(sz=" + sym.stSize + ")",
-                    elf, info, sym.cleanVaddr(), sym.isThumbFunc(), dumpLen);
+            int totalBytes = (int) Math.min(2048L, sym.stSize > 0 ? sym.stSize : 128L);
+            if (totalBytes < 24) totalBytes = (int) Math.max(sym.stSize, 24L);
+            dumpElfSymbolChunked(fileName, sym.name + "(sz=" + sym.stSize + ")",
+                    elf, info, sym.cleanVaddr(), sym.isThumbFunc(), totalBytes);
+        }
+    }
+
+    private static void dumpElfSymbolChunked(String fileName, String label, byte[] elf, Elf32Info info,
+                                             long cleanVaddr, boolean isThumb, int totalByteCount) {
+        int dumped = 0;
+        while (dumped < totalByteCount) {
+            int chunk = Math.min(160, totalByteCount - dumped);
+            String chunkLabel = (totalByteCount <= 160)
+                    ? label
+                    : String.format(Locale.US, "%s+0x%x", label, Integer.valueOf(dumped));
+            dumpElfBytesAtVaddr(fileName, chunkLabel, elf, info, cleanVaddr + dumped, isThumb, chunk);
+            dumped += chunk;
         }
     }
 
@@ -958,13 +1031,18 @@ public final class BtStackProbe {
                 "libft2.so", "libbcc.so", "libbcinfo.so", "libllvm.so",
                 "libwpa_client.so", "libnetd_client.so", "libmemtrack.so",
                 "libpowermanager.so", "libsync.so", "libaudioutils.so",
-                "libcommon_time_client.so", "libnbaudio.so", "libspeexresampler.so",
+                "libcommon_time_client.so", "libnbaudio.so", "libnbaio.so", "libspeexresampler.so",
                 "libeffects.so", "librs_jni.so", "libjavacrypto.so", "libportable.so",
                 "libvariablespeed.so", "libleafiaaac.so", "libbt-codec_aac_dec.so",
                 "libbt-client-api.so", "libbtsound.so", "libtinyalsa.so",
                 "libopensles.so", "libETC1.so", "libetc1.so", "libpixelflinger.so",
                 "libcorkscrew.so", "libgccdemangle.so", "libusbhost.so",
-                "libhmgapi_hook.so"
+                "libhmgapi_hook.so",
+                "librearcamera_client.so", "libgabi++.so", "libtsm_ask_server.so",
+                "libtsm_securestorage.so", "libteec.so", "libca_interface.so",
+                "libmtp.so", "libexif.so", "libtccsubtitle.so", "libtccintersubtitle.so",
+                "libconnectivitymanager.so", "libhdcp2api.so", "libvoipsound.so",
+                "libwilhelm.so", "libpower.so", "libpmap.so"
         };
         for (int i = 0; i < stdExact.length; i++) {
             if (stdExact[i].equals(lowerName)) return true;
@@ -972,6 +1050,7 @@ public final class BtStackProbe {
         return lowerName.startsWith("libgles")
                 || lowerName.startsWith("libharfbuzz")
                 || lowerName.startsWith("libstagefright")
+                || lowerName.startsWith("libvideoeditor")
                 || lowerName.startsWith("libdrm")
                 || lowerName.startsWith("libcamera")
                 || lowerName.startsWith("libwebrtc")
@@ -1031,7 +1110,7 @@ public final class BtStackProbe {
     }
 
     private static void probeSystemFilesAndDaemons() {
-        DiagLogger.log("BT_PROBE", "[8/8] Unfiltered HAL directories, /dev nodes, USB sysfs, props & processes:");
+        DiagLogger.log("BT_PROBE", "[9/9] Unfiltered HAL directories, /dev nodes, USB sysfs, props & processes:");
 
         // Unfiltered HAL directory listings so no weirdly named HAL .so can hide
         listAllFiles("/system/lib/hw");

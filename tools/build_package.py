@@ -79,6 +79,8 @@ shutil.rmtree(BUILD_DIR, ignore_errors=True)
 os.makedirs(os.path.join(BUILD_DIR, "gen"), exist_ok=True)
 os.makedirs(os.path.join(BUILD_DIR, "classes"), exist_ok=True)
 os.makedirs(os.path.join(BUILD_DIR, "dex"), exist_ok=True)
+os.makedirs(os.path.join(BUILD_DIR, "hook-stubs"), exist_ok=True)
+os.makedirs(os.path.join(BUILD_DIR, "hook-classes"), exist_ok=True)
 os.makedirs(DIST_DIR, exist_ok=True)
 
 # Ensure icons exist
@@ -86,7 +88,7 @@ if not os.path.isfile(os.path.join(BASE_DIR, "mod", "icons", "tile.png")):
     subprocess.run([sys.executable, os.path.join(BASE_DIR, "tools", "generate_icons.py")], check=True)
 
 # 1. Generate R.java with aapt
-print("\n[1/6] Generating R.java via aapt...")
+print("\n[1/7] Generating R.java via aapt...")
 cmd_gen_r = [
     AAPT,
     "package",
@@ -105,7 +107,7 @@ r_java_files = glob.glob(os.path.join(BUILD_DIR, "gen", "**", "R.java"), recursi
 print("  Generated R.java:", r_java_files)
 
 # 2. Compile Java Sources
-print("\n[2/6] Compiling Java sources with javac (target: Java 8)...")
+print("\n[2/7] Compiling Java sources with javac (target: Java 8)...")
 java_srcs = sorted(glob.glob(os.path.join(BASE_DIR, "app", "src", "**", "*.java"), recursive=True)) + r_java_files
 lib_jars = sorted(glob.glob(os.path.join(BASE_DIR, "app", "libs", "*.jar")))
 classpath = ANDROID_JAR
@@ -128,7 +130,7 @@ subprocess.run(cmd_javac, check=True)
 print("  Compiled", len(java_srcs), "Java source files.")
 
 # 3. Shrink, optimize & convert class files to Dalvik dex (min-api 19) via R8
-print("\n[3/6] Shrinking & converting bytecode to Dalvik DEX via R8 (min-api 19)...")
+print("\n[3/7] Shrinking & converting bytecode to Dalvik DEX via R8 (min-api 19)...")
 class_files = []
 for root, _, files in os.walk(os.path.join(BUILD_DIR, "classes")):
     for f in sorted(files):
@@ -156,7 +158,7 @@ dex_file = os.path.join(BUILD_DIR, "dex", "classes.dex")
 print("  Generated classes.dex (", os.path.getsize(dex_file), "bytes)")
 
 # 4. Package resources with aapt
-print("\n[4/6] Packaging APK resources via aapt...")
+print("\n[4/7] Packaging APK resources via aapt...")
 unsigned_apk = os.path.join(BUILD_DIR, "unsigned.apk")
 cmd_aapt = [
     AAPT,
@@ -178,7 +180,7 @@ with zipfile.ZipFile(unsigned_apk, "a", compression=zipfile.ZIP_DEFLATED, compre
 print("  Injected classes.dex into APK.")
 
 # 5. Zipalign & Sign APK (strictly v1 JAR signature for Android 4.4.2 KitKat)
-print("\n[5/6] Zipaligning & signing APK (v1 JAR signature)...")
+print("\n[5/7] Zipaligning & signing APK (v1 JAR signature)...")
 aligned_apk = os.path.join(BUILD_DIR, "aligned.apk")
 subprocess.run([ZIPALIGN, "-f", "4", unsigned_apk, aligned_apk], check=True)
 
@@ -231,12 +233,55 @@ cmd_sign = [
 subprocess.run(cmd_sign, check=True)
 print("  Successfully signed Bvm02Monitor.apk (", os.path.getsize(final_apk), "bytes)")
 
-# 6. Package HMG-API Mod & NEMESIS Packages
-print("\n[6/6] Packaging and signing HMG-API Mod & NEMESIS USB archives...")
+# 6. Build HMG-API com.android.bluetooth Hook Module (hooks.jar, Dalvik dex 035, min-api 19)
+print("\n[6/7] Compiling HMG-API hook module (hooks.jar, min-api 19)...")
 mod_stage = os.path.join(BUILD_DIR, "mod")
 os.makedirs(os.path.join(mod_stage, "app"), exist_ok=True)
 os.makedirs(os.path.join(mod_stage, "icons"), exist_ok=True)
 
+hook_stub_srcs = sorted(glob.glob(os.path.join(BASE_DIR, "hook", "stubs", "**", "*.java"), recursive=True))
+hook_srcs = sorted(glob.glob(os.path.join(BASE_DIR, "hook", "src", "**", "*.java"), recursive=True))
+if hook_srcs:
+    hook_stubs_dir = os.path.join(BUILD_DIR, "hook-stubs")
+    hook_classes_dir = os.path.join(BUILD_DIR, "hook-classes")
+    if hook_stub_srcs:
+        subprocess.run(
+            [JAVAC, "--release", "8", "-nowarn", "-Xlint:-options", "-cp", ANDROID_JAR, "-d", hook_stubs_dir]
+            + hook_stub_srcs,
+            check=True,
+        )
+    hook_cp = ANDROID_JAR + (os.pathsep + hook_stubs_dir if hook_stub_srcs else "")
+    subprocess.run(
+        [JAVAC, "--release", "8", "-nowarn", "-Xlint:-options", "-cp", hook_cp, "-d", hook_classes_dir]
+        + hook_srcs,
+        check=True,
+    )
+    hook_class_files = []
+    for root, _, files in os.walk(hook_classes_dir):
+        for f in sorted(files):
+            if f.endswith(".class"):
+                hook_class_files.append(os.path.join(root, f))
+    hooks_jar_out = os.path.join(mod_stage, "hooks.jar")
+    cmd_d8_hook = [
+        JAVA,
+        "-cp",
+        D8_JAR,
+        "com.android.tools.r8.D8",
+        "--release",
+        "--min-api",
+        "19",
+        "--lib",
+        ANDROID_JAR,
+        "--classpath",
+        hook_stubs_dir,
+        "--output",
+        hooks_jar_out,
+    ] + hook_class_files
+    subprocess.run(cmd_d8_hook, check=True)
+    print("  Generated hooks.jar (", os.path.getsize(hooks_jar_out), "bytes)")
+
+# 7. Package HMG-API Mod & NEMESIS Packages
+print("\n[7/7] Packaging and signing HMG-API Mod & NEMESIS USB archives...")
 shutil.copy2(os.path.join(BASE_DIR, "mod", "mod.json"), mod_stage)
 if os.path.isfile(os.path.join(BASE_DIR, "mod", "open.sh")):
     shutil.copy2(os.path.join(BASE_DIR, "mod", "open.sh"), mod_stage)

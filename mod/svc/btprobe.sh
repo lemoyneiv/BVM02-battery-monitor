@@ -1,6 +1,6 @@
 #!/system/bin/sh
-# Strictly read-only, passive Gen5W Bluetooth HAL & process map inspector (v0.1.5).
-# Zero writes to /system, /data, or USB; zero /data or PII/VIN/serial reads.
+# Strictly read-only, passive Gen5W Bluetooth HAL & process map inspector (v0.1.6).
+# Zero writes to /system, /data, or USB; zero /data content or PII/VIN/serial reads.
 
 run_ts="$(date +%s 2>/dev/null)"
 echo "=== BEGIN BTPROBE ROOT READ-ONLY SNAPSHOT (ts=$run_ts) ==="
@@ -23,7 +23,7 @@ if [ -n "$btpid" ] && [ -r "/proc/$btpid/maps" ]; then
     seen="|"
     while read -r range perms off dev inode path rest; do
         case "$path" in
-            /system/*|/vendor/*|/dev/*)
+            /system/*|/vendor/*|/dev/*|*bvm02-gen5w*)
                 case "$seen" in
                     *"|$path|"*) ;;
                     *)
@@ -50,6 +50,14 @@ if [ -n "$btpid" ] && [ -r "/proc/$btpid/maps" ]; then
 else
     echo "BTPID_WARN: com.android.bluetooth process maps unavailable (btpid=$btpid)"
 fi
+
+logcat -d -s HMG-API:V BVM02Hook:V 2>/dev/null | while IFS= read -r hline; do
+    case "$hline" in
+        *bvm02-gen5w*|*BVM02Hook*|*@bvm02_ble*)
+            echo "HMGLOG: $hline"
+            ;;
+    esac
+done
 
 for d in /system/lib/hw /vendor/lib /vendor/lib/hw; do
     if [ -d "$d" ]; then

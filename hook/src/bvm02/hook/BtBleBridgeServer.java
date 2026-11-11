@@ -1,0 +1,128 @@
+package bvm02.hook;
+
+import android.net.Credentials;
+import android.net.LocalServerSocket;
+import android.net.LocalSocket;
+
+import java.io.BufferedReader;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
+import java.nio.charset.Charset;
+import java.util.List;
+import java.util.concurrent.atomic.AtomicBoolean;
+
+import hmgapi.hook.LoadedApp;
+import hmgapi.hook.ModContext;
+
+/**
+ * Lightweight, zero-disk-I/O abstract UNIX domain socket server ({@code @bvm02_ble})
+ * running strictly inside {@code com.android.bluetooth}.
+ */
+public final class BtBleBridgeServer {
+
+    public static final String SOCKET_NAME = "bvm02_ble";
+    private static final Charset UTF8 = Charset.forName("UTF-8");
+    private static final AtomicBoolean STARTED = new AtomicBoolean(false);
+    private static volatile boolean modEnabled = true;
+
+    private BtBleBridgeServer() {}
+
+    public static void setModEnabled(boolean enabled) {
+        modEnabled = enabled;
+    }
+
+    public static void startIfNeeded(final ModContext mod, final LoadedApp app) {
+        if (!STARTED.compareAndSet(false, true)) {
+            return;
+        }
+        modEnabled = (mod == null) || mod.enabled();
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                runAcceptLoop(mod, app);
+            }
+        }, "Bvm02BleBridge");
+        t.setDaemon(true);
+        t.setPriority(Thread.NORM_PRIORITY - 1);
+        t.start();
+    }
+
+    private static void runAcceptLoop(ModContext mod, LoadedApp app) {
+        LocalServerSocket server = null;
+        try {
+            server = new LocalServerSocket(SOCKET_NAME);
+            if (mod != null) {
+                mod.log("BtBleBridgeServer listening on abstract @" + SOCKET_NAME
+                        + " in " + (app != null ? app.processName : "com.android.bluetooth"));
+            }
+            while (true) {
+                LocalSocket client = null;
+                try {
+                    client = server.accept();
+                    if (client != null) {
+                        handleClient(mod, client);
+                    }
+                } catch (Throwable clientErr) {
+                    if (mod != null) {
+                        mod.log("BtBleBridgeServer client err: " + clientErr);
+                    }
+                } finally {
+                    if (client != null) {
+                        try { client.close(); } catch (Throwable ignored) {}
+                    }
+                }
+            }
+        } catch (Throwable bindErr) {
+            STARTED.set(false);
+            if (mod != null) {
+                mod.log("BtBleBridgeServer bind @" + SOCKET_NAME + " failed: " + bindErr);
+            }
+        } finally {
+            if (server != null) {
+                try { server.close(); } catch (Throwable ignored) {}
+            }
+        }
+    }
+
+    private static void handleClient(ModContext mod, LocalSocket client) throws Exception {
+        client.setSoTimeout(2500);
+        Credentials creds = client.getPeerCredentials();
+        int uid = (creds != null) ? creds.getUid() : -1;
+        if (uid < 0 || (uid != 0 && uid != 1000 && uid != 1002 && uid < 10000)) {
+            return;
+        }
+
+        BufferedReader reader = new BufferedReader(new InputStreamReader(client.getInputStream(), UTF8));
+        OutputStream os = client.getOutputStream();
+        String cmd = reader.readLine();
+        if (cmd == null) {
+            return;
+        }
+        cmd = cmd.trim();
+
+        StringBuilder resp = new StringBuilder(512);
+        if ("PING".equals(cmd)) {
+            resp.append("OK PONG version=0.1.6 pid=")
+                    .append(android.os.Process.myPid())
+                    .append(" uid=")
+                    .append(android.os.Process.myUid())
+                    .append(" enabled=")
+                    .append(modEnabled && (mod == null || mod.enabled()))
+                    .append('\n');
+        } else if ("CAPS".equals(cmd)) {
+            if (!modEnabled || (mod != null && !mod.enabled())) {
+                resp.append("CAPS: status=MOD_DISABLED\n");
+            } else {
+                List<String> lines = BtMemInspector.inspectLiveCapabilities(mod);
+                for (int i = 0; i < lines.size(); i++) {
+                    resp.append("CAPS: ").append(lines.get(i)).append('\n');
+                }
+            }
+        } else {
+            resp.append("ERR UNKNOWN_CMD\n");
+        }
+        resp.append("END\n");
+        os.write(resp.toString().getBytes(UTF8));
+        os.flush();
+    }
+}

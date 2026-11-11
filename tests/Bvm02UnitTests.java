@@ -1,12 +1,19 @@
+import bvm02.app.BtStackProbe;
 import bvm02.app.Bvm02Protocol;
 import bvm02.app.ScreenshotHelper;
 import bvm02.app.SensorConfig;
 
+import java.io.ByteArrayOutputStream;
+import java.io.File;
+import java.io.FileInputStream;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
 import java.util.List;
 
 /**
  * Host JVM unit test suite for BVM02 protocol framing, BLE scanRecord parsing,
- * 20-byte ATT multi-chunk reassembly, 12V/24V SoC curves, MAC validation, and Telechips BGRA fix.
+ * 20-byte ATT multi-chunk reassembly, 12V/24V SoC curves, MAC validation, Telechips BGRA fix,
+ * and in-RAM Dalvik DEX / ODEX class & method introspection.
  */
 public final class Bvm02UnitTests {
 
@@ -33,7 +40,7 @@ public final class Bvm02UnitTests {
         passed++;
     }
 
-    public static void main(String[] args) {
+    public static void main(String[] args) throws Exception {
         testFrameCodecAndPinCommands();
         testMultiChunkFrameAssembler();
         testBleTxChunkSplitting();
@@ -43,6 +50,7 @@ public final class Bvm02UnitTests {
         testPiecewiseSocAndHealthCurve();
         testSensorConfigValidation();
         testTelechipsBgraSwapDetector();
+        testInRamDexInventoryParser(args.length > 0 ? args[0] : "build/dex/classes.dex");
 
         System.out.println("  [OK] Bvm02UnitTests passed all " + passed + " assertions.");
     }
@@ -281,5 +289,67 @@ public final class Bvm02UnitTests {
 
         ScreenshotHelper.swapRedBlueInPlace(swappedPixels);
         assertEquals("restored R/B channel pixel", 0xFF0091FF, swappedPixels[0]);
+    }
+
+    private static void testInRamDexInventoryParser(String dexPath) throws Exception {
+        File dexFile = new File(dexPath);
+        assertTrue("classes.dex exists for DEX parser test", dexFile.isFile());
+
+        ByteArrayOutputStream bos = new ByteArrayOutputStream((int) dexFile.length());
+        FileInputStream fis = new FileInputStream(dexFile);
+        try {
+            byte[] buf = new byte[8192];
+            int n;
+            while ((n = fis.read(buf)) >= 0) {
+                bos.write(buf, 0, n);
+            }
+        } finally {
+            fis.close();
+        }
+        byte[] dexBytes = bos.toByteArray();
+
+        List<BtStackProbe.DexClassEntry> classes = BtStackProbe.extractDexInventory(dexBytes);
+        assertTrue("extracted >= 8 app classes from classes.dex", classes.size() >= 8);
+
+        BtStackProbe.DexClassEntry protoCls = null;
+        BtStackProbe.DexClassEntry probeCls = null;
+        for (int i = 0; i < classes.size(); i++) {
+            BtStackProbe.DexClassEntry ce = classes.get(i);
+            if ("bvm02.app.Bvm02Protocol".equals(ce.className)) protoCls = ce;
+            if ("bvm02.app.BtStackProbe".equals(ce.className)) probeCls = ce;
+        }
+        assertTrue("found Bvm02Protocol in DEX inventory", protoCls != null);
+        assertTrue("found BtStackProbe in DEX inventory", probeCls != null);
+
+        boolean foundParseVolt = false;
+        for (int i = 0; i < protoCls.declaredMethods.size(); i++) {
+            String sig = protoCls.declaredMethods.get(i);
+            if (sig.contains("parseRealtimeVoltage(byte[])")) {
+                foundParseVolt = true;
+                break;
+            }
+        }
+        assertTrue("DEX parser decoded parseRealtimeVoltage(byte[]) signature", foundParseVolt);
+
+        // Also test Dalvik DexOptHeader ("dey\n036\0") .odex unwrapping
+        byte[] fakeOdex = new byte[40 + dexBytes.length + 16];
+        fakeOdex[0] = 'd';
+        fakeOdex[1] = 'e';
+        fakeOdex[2] = 'y';
+        fakeOdex[3] = '\n';
+        fakeOdex[4] = '0';
+        fakeOdex[5] = '3';
+        fakeOdex[6] = '6';
+        fakeOdex[7] = 0;
+        ByteBuffer hdr = ByteBuffer.wrap(fakeOdex).order(ByteOrder.LITTLE_ENDIAN);
+        hdr.putInt(8, 40);
+        hdr.putInt(12, dexBytes.length);
+        System.arraycopy(dexBytes, 0, fakeOdex, 40, dexBytes.length);
+
+        List<BtStackProbe.DexClassEntry> odexClasses = BtStackProbe.extractDexInventory(fakeOdex);
+        assertEquals("odex class count matches dex class count", classes.size(), odexClasses.size());
+
+        // Malformed / truncated buffers return empty list safely
+        assertEquals("reject short buffer", 0, BtStackProbe.extractDexInventory(new byte[10]).size());
     }
 }

@@ -24,7 +24,7 @@ public final class DiagLogger {
 
     private static final String LOGCAT_TAG = "BVM02Gen5W";
     private static final Charset UTF8 = Charset.forName("UTF-8");
-    private static final int MAX_LOG_LINES = 1500;
+    private static final int MAX_LOG_LINES = 4500;
     private static final int MAX_CSV_SAMPLES = 3600;
 
     public interface LogListener {
@@ -72,7 +72,7 @@ public final class DiagLogger {
     private static volatile LogListener listener;
 
     static {
-        log("INIT", "BVM02 Battery Monitor v0.1.0 initialized (SDK=" + Build.VERSION.SDK_INT
+        log("INIT", "BVM02 Battery Monitor v0.1.1 initialized (SDK=" + Build.VERSION.SDK_INT
                 + ", Release=" + Build.VERSION.RELEASE
                 + ", Model=" + Build.MODEL
                 + ", Product=" + Build.PRODUCT

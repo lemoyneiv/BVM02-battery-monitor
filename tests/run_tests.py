@@ -61,7 +61,7 @@ def test_java_unit_suite() -> None:
         cp_compile = f"{ANDROID_JAR}{os.pathsep}{CLASSES_DIR}"
         run_cmd(["javac", "--release", "8", "-cp", cp_compile, "-d", tmp, str(test_src)])
         cp_run = f"{tmp}{os.pathsep}{CLASSES_DIR}{os.pathsep}{ANDROID_JAR}"
-        out = run_cmd(["java", "-cp", cp_run, "Bvm02UnitTests"])
+        out = run_cmd(["java", "-cp", cp_run, "Bvm02UnitTests", str(DEX_PATH)])
         print(out.strip())
 
 
@@ -272,18 +272,20 @@ def test_apk_alignment_and_v1_signature() -> None:
 
 def test_distribution_archives_and_hmg_signature() -> None:
     step("5. HMG-API & NEMESIS Distribution Archives + ECDSA Signature Verification")
+    mod_meta = json.loads((BASE_DIR / "mod" / "mod.json").read_text(encoding="utf-8"))
+    ver_str = mod_meta["version"]
     expected_zips = [
-        "bvm02-gen5w-v0.1.0.hmgapi.zip",
-        "bvm02-gen5w-v0.1.0-hmgapi-usb.zip",
-        "bvm02-gen5w-v0.1.0-nemesis-package.zip",
-        "bvm02-gen5w-v0.1.0-nemesis-usb.zip",
+        f"bvm02-gen5w-v{ver_str}.hmgapi.zip",
+        f"bvm02-gen5w-v{ver_str}-hmgapi-usb.zip",
+        f"bvm02-gen5w-v{ver_str}-nemesis-package.zip",
+        f"bvm02-gen5w-v{ver_str}-nemesis-usb.zip",
     ]
     for zname in expected_zips:
         zp = DIST_DIR / zname
         if not zp.is_file() or zp.stat().st_size == 0:
             fail(f"Missing distribution archive: {zp}")
 
-    hmg_zip = DIST_DIR / "bvm02-gen5w-v0.1.0.hmgapi.zip"
+    hmg_zip = DIST_DIR / f"bvm02-gen5w-v{ver_str}.hmgapi.zip"
     with zipfile.ZipFile(hmg_zip, "r") as zf:
         names = set(zf.namelist())
         required = {
@@ -331,15 +333,15 @@ def test_distribution_archives_and_hmg_signature() -> None:
             if expected_hash != actual_hash:
                 fail(f"META-HMGAPI/manifest.json SHA-256 mismatch on {rel_path}")
 
-    with zipfile.ZipFile(DIST_DIR / "bvm02-gen5w-v0.1.0-hmgapi-usb.zip", "r") as zf:
-        if "HMGAPI/updates/bvm02-gen5w-v0.1.0.zip" not in zf.namelist():
-            fail("hmgapi-usb.zip missing HMGAPI/updates/bvm02-gen5w-v0.1.0.zip")
+    with zipfile.ZipFile(DIST_DIR / f"bvm02-gen5w-v{ver_str}-hmgapi-usb.zip", "r") as zf:
+        if f"HMGAPI/updates/bvm02-gen5w-v{ver_str}.zip" not in zf.namelist():
+            fail(f"hmgapi-usb.zip missing HMGAPI/updates/bvm02-gen5w-v{ver_str}.zip")
 
-    with zipfile.ZipFile(DIST_DIR / "bvm02-gen5w-v0.1.0-nemesis-usb.zip", "r") as zf:
+    with zipfile.ZipFile(DIST_DIR / f"bvm02-gen5w-v{ver_str}-nemesis-usb.zip", "r") as zf:
         if "NEMESIS.data" not in zf.namelist() or "packages/hmgapi.bvm02-gen5w.zip" not in zf.namelist():
             fail("nemesis-usb.zip missing NEMESIS.data or packages/hmgapi.bvm02-gen5w.zip")
 
-    print(f"  [OK] All 4 dist/*.zip archives & HMG-API ECDSA P-256 signature verified (uuid={uuid_str})")
+    print(f"  [OK] All 4 dist/*v{ver_str}*.zip archives & HMG-API ECDSA P-256 signature verified (uuid={uuid_str})")
 
 
 def test_shell_scripts_and_flash_safety() -> None:

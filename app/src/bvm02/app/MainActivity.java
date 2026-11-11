@@ -3,6 +3,7 @@ package bvm02.app;
 import android.app.Activity;
 import android.app.AlertDialog;
 import android.bluetooth.BluetoothAdapter;
+import android.bluetooth.BluetoothDevice;
 import android.content.BroadcastReceiver;
 import android.content.Context;
 import android.content.DialogInterface;
@@ -188,6 +189,9 @@ public class MainActivity extends Activity implements BleClient.Listener, DiagLo
         refreshDiagnosticsPanel();
         switchTab(TAB_MONITOR);
 
+        // Run read-only Gen5W Bluetooth & Broadcom DEX stack probe in background on startup
+        triggerAsyncBtStackProbe();
+
         // Auto-connect to active saved sensor slot on launch if configured
         SensorConfig initialSensor = sensorStore.getSlot(sensorStore.getActiveSlot());
         if (initialSensor.isConfigured()) {
@@ -205,6 +209,22 @@ public class MainActivity extends Activity implements BleClient.Listener, DiagLo
             DiagLogger.log("UI", "No saved BVM02 sensor in Slot " + (sensorStore.getActiveSlot() + 1)
                     + ". Ready to scan or add by MAC.");
         }
+    }
+
+    private void triggerAsyncBtStackProbe() {
+        BtStackProbe.runAsyncProbe(this, new Runnable() {
+            @Override
+            public void run() {
+                uiHandler.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        if (!isFinishing() && currentTab == TAB_DIAG) {
+                            refreshDiagnosticsPanel();
+                        }
+                    }
+                });
+            }
+        });
     }
 
     @Override
@@ -446,7 +466,8 @@ public class MainActivity extends Activity implements BleClient.Listener, DiagLo
         btnRefreshBtInfo.setOnClickListener(new View.OnClickListener() {
             @Override
             public void onClick(View v) {
-                DiagLogger.log("BT_PROBE", "Manual BT stack probe:\n" + bleClient.buildHardwareSummary());
+                DiagLogger.log("BT_PROBE", "Manual BT stack summary:\n" + bleClient.buildHardwareSummary());
+                triggerAsyncBtStackProbe();
                 refreshCompactBtStatus();
                 refreshDiagnosticsPanel();
             }
@@ -728,6 +749,12 @@ public class MainActivity extends Activity implements BleClient.Listener, DiagLo
         if (isFinishing()) return;
         btnScanToggle.setText(scanning ? "Stop Scan" : "Start BLE Scan");
         btnScanToggle.setBackgroundColor(colorRes(scanning ? R.color.accent_red : R.color.accent_blue));
+        if (scanning && bleClient.isUsingDiscoveryFallback() && filterBvm02Only) {
+            filterBvm02Only = false;
+            btnScanFilter.setText("Filter: Show All");
+            btnScanFilter.setTextColor(colorRes(R.color.accent_gold));
+            rebuildFilteredScanList();
+        }
         tvScanSummary.setText(summary);
         refreshCompactBtStatus();
     }
@@ -742,8 +769,13 @@ public class MainActivity extends Activity implements BleClient.Listener, DiagLo
     private void rebuildFilteredScanList() {
         List<BleClient.ScannedDevice> visible = new ArrayList<BleClient.ScannedDevice>();
         int bvmMatches = 0;
+        int leOrDualCount = 0;
         for (BleClient.ScannedDevice d : allScannedDevices) {
             if (d.bvm02Match) bvmMatches++;
+            if (d.deviceType == BluetoothDevice.DEVICE_TYPE_LE
+                    || d.deviceType == BluetoothDevice.DEVICE_TYPE_DUAL) {
+                leOrDualCount++;
+            }
             if (!filterBvm02Only || d.bvm02Match) {
                 visible.add(d);
             }
@@ -755,17 +787,20 @@ public class MainActivity extends Activity implements BleClient.Listener, DiagLo
             tvScanEmpty.setVisibility(View.VISIBLE);
             if (hiddenCount > 0) {
                 tvScanEmpty.setText("0 BVM02 devices matched so far, but " + hiddenCount
-                        + " other BLE peripheral(s) were detected (confirming Gen5W BLE RX works!). Tap 'Filter: BVM02 Only' above to inspect all peripherals.");
+                        + " other peripheral(s) were detected! Tap 'Filter: BVM02 Only' above to inspect all peripherals.");
             } else {
-                tvScanEmpty.setText("Note: BVM02 is a single-connection BLE peripheral. Disconnect any phone app from the BVM02 so it advertises on BLE.");
+                tvScanEmpty.setText("Note: BVM02 is a single-connection BLE peripheral. Close any phone app connected to BVM02 so it advertises, or tap 'Add by MAC' to test direct GATT connection.");
             }
         } else {
             tvScanEmpty.setVisibility(View.GONE);
         }
 
         if (bleClient.isScanning()) {
-            tvScanSummary.setText("Scanning... " + bvmMatches + " BVM02 match(es), "
-                    + allScannedDevices.size() + " total BLE peripheral(s) seen.");
+            String modePrefix = bleClient.isUsingDiscoveryFallback()
+                    ? "Inquiry fallback... "
+                    : "Scanning BLE... ";
+            tvScanSummary.setText(modePrefix + bvmMatches + " BVM02 match(es), "
+                    + leOrDualCount + " LE/Dual, " + allScannedDevices.size() + " total seen.");
         }
     }
 
@@ -1259,7 +1294,7 @@ public class MainActivity extends Activity implements BleClient.Listener, DiagLo
             TextView tvRssi = (TextView) row.findViewById(R.id.tv_item_rssi);
             TextView tvAction = (TextView) row.findViewById(R.id.tv_item_action_hint);
 
-            tvName.setText(d.name.isEmpty() ? "<Unnamed BLE Peripheral>" : d.name);
+            tvName.setText(d.name.isEmpty() ? "<Unnamed Peripheral>" : d.name);
 
             int savedSlot = sensorStore.findSlotByMac(d.mac);
             if (savedSlot >= 0) {
@@ -1274,9 +1309,27 @@ public class MainActivity extends Activity implements BleClient.Listener, DiagLo
                 tvBadge.setTextColor(colorRes(R.color.accent_green));
                 tvBadge.setBackgroundColor(0xFF1C3B2B);
                 tvAction.setText("Pair & Connect");
+            } else if (d.deviceType == BluetoothDevice.DEVICE_TYPE_LE) {
+                tvBadge.setVisibility(View.VISIBLE);
+                tvBadge.setText("LE PERIPHERAL");
+                tvBadge.setTextColor(colorRes(R.color.accent_cyan));
+                tvBadge.setBackgroundColor(0xFF163247);
+                tvAction.setText("Select");
+            } else if (d.deviceType == BluetoothDevice.DEVICE_TYPE_DUAL) {
+                tvBadge.setVisibility(View.VISIBLE);
+                tvBadge.setText("DUAL BT+LE");
+                tvBadge.setTextColor(colorRes(R.color.accent_gold));
+                tvBadge.setBackgroundColor(0xFF3A2E16);
+                tvAction.setText("Select");
+            } else if (d.deviceType == BluetoothDevice.DEVICE_TYPE_CLASSIC) {
+                tvBadge.setVisibility(View.VISIBLE);
+                tvBadge.setText("CLASSIC BT");
+                tvBadge.setTextColor(colorRes(R.color.text_secondary));
+                tvBadge.setBackgroundColor(0xFF252B36);
+                tvAction.setText("Select");
             } else {
                 tvBadge.setVisibility(View.VISIBLE);
-                tvBadge.setText("OTHER BLE");
+                tvBadge.setText("UNKNOWN TYPE");
                 tvBadge.setTextColor(colorRes(R.color.text_secondary));
                 tvBadge.setBackgroundColor(0xFF252B36);
                 tvAction.setText("Select");

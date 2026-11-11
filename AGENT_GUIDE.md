@@ -25,15 +25,16 @@ This guide documents the hardware, operating system, Bluetooth LE, flash-wear, a
 
 ---
 
-## 2. Gen5W Bluetooth LE (API 19) Invariants
+## 2. Gen5W Bluetooth LE (API 19 & Broadcom Stack) Invariants
 
-1. **API 19 BLE Scanning Only:**
-   * Use `BluetoothAdapter.startLeScan(LeScanCallback)` and `stopLeScan(LeScanCallback)`.
+1. **API 19 BLE Scanning + Dual-Mode Inquiry Fallback:**
+   * Try `BluetoothAdapter.startLeScan(LeScanCallback)` first, and if Gen5W Broadcom firmware returns `false` (when `/system/framework/com.broadcom.bt.jar` replaces Bluedroid `IBluetoothGatt`), automatically fall back to `BluetoothAdapter.startDiscovery()` (`ACTION_FOUND` / `ACTION_NAME_CHANGED`) and sort `DEVICE_TYPE_LE` / `DEVICE_TYPE_DUAL` peripherals ahead of Classic BT devices.
+   * Declare `<uses-library android:name="com.broadcom.bt" android:required="false" />` in `AndroidManifest.xml` so Dalvik links Gen5W's Broadcom Bluetooth shared library when present without blocking installation elsewhere.
    * Never reference `android.bluetooth.le.*` (`BluetoothLeScanner`, `ScanFilter`, `ScanSettings`), which were introduced in API 21.
    * Parse advertised device names (`0x08` / `0x09`) and `0xFFF0` service UUIDs directly from `byte[] scanRecord` (`Bvm02Protocol.parseAdvertisedName`), because `BluetoothDevice.getName()` is frequently `null` on KitKat BLE scan callbacks.
 
-2. **Stop Scan Before `connectGatt` & Use 3-Arg Overload:**
-   * Always stop any active LE scan (`stopLeScan`) **before** initiating `BluetoothDevice.connectGatt(context, false, callback)` on the main thread. Concurrent LE scanning + GATT connection setup is a primary trigger of Broadcom KitKat GATT `status=133` failures.
+2. **Stop Scan & Cancel Discovery Before `connectGatt` & Use 3-Arg Overload:**
+   * Always stop any active LE scan (`stopLeScan`) and cancel inquiry (`cancelDiscovery`) **before** initiating `BluetoothDevice.connectGatt(context, false, callback)` on the main thread. Concurrent scanning/inquiry + GATT connection setup is a primary trigger of Broadcom KitKat GATT `status=133` failures.
    * Never call the 4-argument `connectGatt(..., TRANSPORT_LE)` overload (API 23).
 
 3. **Non-MTU Operation (20-Byte ATT Payload) & Serialized GATT Queue:**
@@ -50,7 +51,7 @@ This guide documents the hardware, operating system, Bluetooth LE, flash-wear, a
 
 * Automotive eMMC flash inside the head unit is soldered and non-replaceable.
 * **Never write diagnostic logs, voltage CSV traces, or temporary files to `/data`, `getFilesDir()`, `getCacheDir()`, or SQLite.**
-* `DiagLogger` maintains bounded ring buffers strictly in RAM (`1,500` log lines, `3,600` telemetry samples) and exports atomically (`.*.part` -> `renameTo`) **only** to an external USB drive (`<usb>/BVM02Logs/`) upon explicit user request.
+* `DiagLogger` maintains bounded ring buffers strictly in RAM (`4,500` log lines, `3,600` telemetry samples) and exports atomically (`.*.part` -> `renameTo`) **only** to an external USB drive (`<usb>/BVM02Logs/`) upon explicit user request.
 * `SensorStore` writes `SharedPreferences` **strictly** when the user explicitly adds, edits, removes, or switches a saved sensor slot — never during live BLE polling.
 
 ---

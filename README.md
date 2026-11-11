@@ -14,12 +14,13 @@ The LNEX BVM02 battery monitor's original companion Android app (`BatterySense` 
 
 ---
 
-## Current Scope — `v0.1.0` Hardware Proof-of-Concept
+## Current Scope — `v0.1.1` Hardware Proof-of-Concept
 
 * **24:9 Automotive Widescreen UI:** Left driver-side navigation sidebar, high-contrast dark theme, and large touch targets tailored for `1920x720` Gen5W screens.
-* **Gen5W API 19 BLE Scanner & Manual MAC Pairing:**
-  * Uses KitKat `BluetoothAdapter.startLeScan()` with direct raw `scanRecord` AD `0x08`/`0x09` name and `0xFFF0` service discovery.
-  * Toggle between **`Filter: BVM02 Only`** and **`Filter: Show All BLE`** to immediately verify head-unit BLE reception on-car, plus **`Add by MAC`** (`AA:BB:CC:DD:EE:FF`) fallback.
+* **Gen5W API 19 BLE Scanner + Dual-Mode Inquiry Fallback & Manual MAC Pairing:**
+  * Tries KitKat `BluetoothAdapter.startLeScan()` (unfiltered and `0xFFF0`-filtered) and automatically falls back to **`BluetoothAdapter.startDiscovery()`** (`ACTION_FOUND` / `ACTION_NAME_CHANGED` with `DEVICE_TYPE_LE` / `DUAL` sorting) when Gen5W Broadcom firmware returns `false` from `startLeScan()`.
+  * Links optional `<uses-library android:name="com.broadcom.bt" android:required="false" />` and runs a read-only in-RAM **`BtStackProbe`** (`IBluetoothGatt` / `ServiceManager` / `/system/framework/com.broadcom.bt.jar` DEX inventory) for on-car diagnostics.
+  * Supports **`Add by MAC`** (`AA:BB:CC:DD:EE:FF`) to directly test `connectGatt()` against a known BVM02 address.
 * **Live Battery Telemetry (`UUID 0xFFF2` @ 1.5s):**
   * Real-time terminal voltage (`0.01 V` precision), piecewise-linear **State-of-Charge (`0–100%`)**, sensor temperature (`°C / °F`), `12V / 24V` auto-detection or manual override, session `Min / Max`, and an allocation-free rolling voltage sparkline trace.
 * **Up to 4 Saved Sensor Slots:** Switch between e.g. Starter 12V, Auxiliary Battery, Trailer, or Secondary vehicle batteries with per-slot custom labels and 4-digit PIN authentication (`0x36` verify / `0x35` update).
@@ -45,10 +46,10 @@ Build artifacts are generated in `dist/` in four formats:
 
 | Package Archive | Target Environment |
 | :--- | :--- |
-| `bvm02-gen5w-v0.1.0-hmgapi-usb.zip` | **HMG-API Auto-Installer:** Extract directly onto the root of a FAT32 USB flash drive (`HMGAPI/updates/bvm02-gen5w-v0.1.0.zip`) and insert into the vehicle's data USB port. |
-| `bvm02-gen5w-v0.1.0.hmgapi.zip` | **HMG-API Mod Archive:** Direct `.hmgapi.zip` package signed with ECDSA P-256 (`META-HMGAPI/signature`). |
-| `bvm02-gen5w-v0.1.0-nemesis-usb.zip` | **NEMESIS USB Sideload:** Extract onto a FAT32 USB drive (`nemesis/apps/...`) for NEMESIS Manager installation. |
-| `bvm02-gen5w-v0.1.0-nemesis-package.zip` | **NEMESIS Store Repository Package.** |
+| `bvm02-gen5w-v0.1.1-hmgapi-usb.zip` | **HMG-API Auto-Installer:** Extract directly onto the root of a FAT32 USB flash drive (`HMGAPI/updates/bvm02-gen5w-v0.1.1.zip`) and insert into the vehicle's data USB port. |
+| `bvm02-gen5w-v0.1.1.hmgapi.zip` | **HMG-API Mod Archive:** Direct `.hmgapi.zip` package signed with ECDSA P-256 (`META-HMGAPI/signature`). |
+| `bvm02-gen5w-v0.1.1-nemesis-usb.zip` | **NEMESIS USB Sideload:** Extract onto a FAT32 USB drive (`nemesis/apps/...`) for NEMESIS Manager installation. |
+| `bvm02-gen5w-v0.1.1-nemesis-package.zip` | **NEMESIS Store Repository Package.** |
 
 ### Manual ADB Install (Bench / Engineering Mode)
 

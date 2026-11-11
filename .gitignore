@@ -1,0 +1,48 @@
+# Build outputs
+build/
+bin/
+gen/
+out/
+
+# Archived development releases
+dist/bvm02-dev-releases/
+bvm02-dev-releases/
+
+# Optional local HMG-API checkout
+third_party/
+
+# Intermediate files
+*.class
+*.dex
+*.obj
+*.o
+
+# Security & Private Keys
+*.keystore
+*.key
+*.key.pub
+*.jks
+*.p12
+
+# Logs and test diagnostics
+logs/
+*.log
+bvm02_debug_log*.txt
+bvm02_log_*.txt
+
+# IDE / Editor configuration
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# OS metadata
+.DS_Store
+Thumbs.db
+desktop.ini

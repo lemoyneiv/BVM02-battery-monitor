@@ -1,0 +1,17 @@
+# Set default behavior to LF for line endings across platforms
+* text=auto eol=lf
+
+# Explicit LF for shell scripts and Linux text files
+*.sh text eol=lf
+*.json text eol=lf
+*.xml text eol=lf
+*.java text eol=lf
+*.md text eol=lf
+*.py text eol=lf
+
+# Binary files
+*.jar binary
+*.so binary
+*.png binary
+*.apk binary
+*.zip binary

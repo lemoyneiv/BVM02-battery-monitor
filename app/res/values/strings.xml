@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">BVM02</string>
+    <string name="app_title_full">BVM02 Battery Monitor</string>
+    <string name="status_disconnected">BLE: Disconnected</string>
+    <string name="tab_monitor">Live Monitor</string>
+    <string name="tab_scanner">BLE Scanner</string>
+    <string name="tab_diag">BT Diagnostics</string>
+    <string name="btn_scan_reconnect">Scan / Reconnect</string>
+    <string name="btn_export_usb">Export Log to USB</string>
+    <string name="btn_exit">Exit</string>
+    <string name="safety_notice">Use only when vehicle is safely parked. Unaffiliated with Hyundai, Kia, Genesis, or LNEX.</string>
+</resources>

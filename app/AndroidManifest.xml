@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="bvm02.app"
+    android:versionCode="1"
+    android:versionName="0.1.0">
+
+    <uses-sdk android:minSdkVersion="19" android:targetSdkVersion="19" />
+
+    <!-- Gen5W ActivityManager checks GET_TASKS during Activity.finish() -->
+    <uses-permission android:name="android.permission.GET_TASKS" />
+
+    <!-- Bluetooth & BLE permissions for Android 4.4.2 (API 19) -->
+    <uses-permission android:name="android.permission.BLUETOOTH" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
+    <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+    <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+
+    <!-- USB flash drive log & screenshot export only (zero automated /data writes) -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
+
+    <!-- Explicitly optional so stock Gen5W firmware missing bluetooth_le.xml never blocks install -->
+    <uses-feature android:name="android.hardware.bluetooth_le" android:required="false" />
+
+    <application
+        android:label="@string/app_name"
+        android:icon="@drawable/ic_app"
+        android:theme="@style/Bvm02Theme"
+        android:allowBackup="false">
+
+        <!-- Prevent aspect ratio letterboxing on 24:9 (1920x720 / 2560x720) Gen5W display -->
+        <meta-data android:name="android.max_aspect" android:value="4.0" />
+
+        <activity
+            android:name=".MainActivity"
+            android:label="@string/app_title_full"
+            android:launchMode="singleTask"
+            android:screenOrientation="landscape"
+            android:configChanges="keyboardHidden|orientation|screenSize">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>

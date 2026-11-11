@@ -1,0 +1,45 @@
+{
+  "id": "bvm02-gen5w",
+  "name": "BVM02 Battery Monitor",
+  "version": "0.1.0",
+  "hmgapi": ">=1.0.0",
+  "authors": ["lemoyneiv"],
+  "license": "AGPL-3.0",
+  "description": "Connect to LNEX BVM02 12V/24V Bluetooth LE battery monitors directly from Gen5W head units. Live voltage, state-of-charge, temperature, session graph, up to 4 saved sensors, and USB diagnostics.",
+  "live": true,
+  "apps": [
+    { "package": "bvm02.app", "apk": "app/Bvm02Monitor.apk" }
+  ],
+  "services": [
+    {
+      "name": "reboot",
+      "script": "svc/reboot.sh",
+      "user": "root",
+      "start": "manual",
+      "restart": false
+    },
+    {
+      "name": "screenshot",
+      "script": "svc/screenshot.sh",
+      "user": "root",
+      "start": "manual",
+      "restart": false
+    }
+  ],
+  "usb": [
+    "BVM02Logs"
+  ],
+  "provides": {
+    "launcher": [
+      {
+        "title": "BVM02",
+        "package": "bvm02.app",
+        "class": ".MainActivity",
+        "icon": "icons/tile.png",
+        "icon_night": "icons/tile.png",
+        "icon_disabled": "icons/tile_disabled.png",
+        "icon_disabled_night": "icons/tile_disabled.png"
+      }
+    ]
+  }
+}

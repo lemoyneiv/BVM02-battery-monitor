@@ -1,0 +1,742 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:orientation="horizontal"
+    android:background="@color/bg_dark">
+
+    <!-- ================= LEFT DRIVER-SIDE NAVIGATION & STATUS SIDEBAR ================= -->
+    <LinearLayout
+        android:id="@+id/layout_sidebar"
+        android:layout_width="220dp"
+        android:layout_height="match_parent"
+        android:orientation="vertical"
+        android:background="@color/bg_panel"
+        android:paddingLeft="12dp"
+        android:paddingRight="12dp"
+        android:paddingTop="12dp"
+        android:paddingBottom="10dp">
+
+        <!-- App Title Header (Tap to save screenshot to USB) -->
+        <LinearLayout
+            android:id="@+id/layout_logo_header"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal"
+            android:gravity="center_vertical"
+            android:paddingTop="2dp"
+            android:paddingBottom="2dp"
+            android:clickable="true"
+            android:focusable="true"
+            android:background="?android:attr/selectableItemBackground"
+            android:layout_marginBottom="8dp">
+
+            <TextView
+                android:id="@+id/tv_title"
+                android:layout_width="0dp"
+                android:layout_height="wrap_content"
+                android:layout_weight="1"
+                android:text="BVM02"
+                android:textColor="@color/accent_blue"
+                android:textSize="21sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/tv_app_version"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="v0.1.0"
+                android:textColor="@color/text_secondary"
+                android:textSize="11sp" />
+        </LinearLayout>
+
+        <!-- BLE Connection Status -->
+        <TextView
+            android:id="@+id/tv_ble_status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/status_disconnected"
+            android:textColor="@color/accent_gold"
+            android:textSize="12sp"
+            android:maxLines="2"
+            android:ellipsize="end"
+            android:layout_marginBottom="6dp" />
+
+        <!-- Quick Scan / Reconnect Button -->
+        <Button
+            android:id="@+id/btn_quick_connect"
+            android:layout_width="match_parent"
+            android:layout_height="38dp"
+            android:layout_marginBottom="14dp"
+            android:text="@string/btn_scan_reconnect"
+            android:background="@color/bg_button"
+            android:textColor="@color/text_primary"
+            android:textSize="13sp" />
+
+        <!-- Navigation Section Label -->
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="NAVIGATION"
+            android:textColor="@color/text_secondary"
+            android:textSize="11sp"
+            android:layout_marginBottom="6dp" />
+
+        <Button
+            android:id="@+id/btn_tab_monitor"
+            android:layout_width="match_parent"
+            android:layout_height="40dp"
+            android:layout_marginBottom="6dp"
+            android:text="@string/tab_monitor"
+            android:background="@color/accent_blue"
+            android:textColor="@color/text_primary"
+            android:textStyle="bold"
+            android:textSize="14sp" />
+
+        <Button
+            android:id="@+id/btn_tab_scanner"
+            android:layout_width="match_parent"
+            android:layout_height="40dp"
+            android:layout_marginBottom="6dp"
+            android:text="@string/tab_scanner"
+            android:background="@color/bg_button"
+            android:textColor="@color/text_primary"
+            android:textSize="14sp" />
+
+        <Button
+            android:id="@+id/btn_tab_diag"
+            android:layout_width="match_parent"
+            android:layout_height="40dp"
+            android:layout_marginBottom="10dp"
+            android:text="@string/tab_diag"
+            android:background="@color/bg_button"
+            android:textColor="@color/text_primary"
+            android:textSize="14sp" />
+
+        <!-- Spacer -->
+        <View
+            android:layout_width="match_parent"
+            android:layout_height="0dp"
+            android:layout_weight="1" />
+
+        <!-- Export Log & Exit Actions -->
+        <Button
+            android:id="@+id/btn_export_log"
+            android:layout_width="match_parent"
+            android:layout_height="36dp"
+            android:layout_marginBottom="6dp"
+            android:text="@string/btn_export_usb"
+            android:background="#2e4057"
+            android:textColor="@color/accent_gold"
+            android:textStyle="bold"
+            android:textSize="12sp" />
+
+        <Button
+            android:id="@+id/btn_exit_app"
+            android:layout_width="match_parent"
+            android:layout_height="36dp"
+            android:layout_marginBottom="8dp"
+            android:text="@string/btn_exit"
+            android:background="@color/bg_button"
+            android:textColor="@color/accent_green"
+            android:textStyle="bold"
+            android:textSize="13sp" />
+
+        <!-- Compact Diagnostic Bar -->
+        <LinearLayout
+            android:id="@+id/layout_diag_bar"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="#151922"
+            android:clickable="true"
+            android:focusable="true"
+            android:padding="6dp">
+
+            <TextView
+                android:id="@+id/tv_diag_info"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="BT: Checking adapter..."
+                android:textColor="#99aabb"
+                android:textSize="10sp"
+                android:maxLines="2"
+                android:ellipsize="end" />
+
+            <TextView
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:gravity="right"
+                android:text="[Diagnostics]"
+                android:textColor="@color/accent_blue"
+                android:textSize="10sp"
+                android:layout_marginTop="2dp" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <!-- Vertical Divider -->
+    <View
+        android:layout_width="1dp"
+        android:layout_height="match_parent"
+        android:background="@color/divider" />
+
+    <!-- ================= MAIN 24:9 WIDESCREEN CONTENT AREA ================= -->
+    <FrameLayout
+        android:layout_width="0dp"
+        android:layout_height="match_parent"
+        android:layout_weight="1">
+
+        <!-- ================= 1. LIVE MONITOR TAB ================= -->
+        <LinearLayout
+            android:id="@+id/layout_mode_monitor"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:orientation="vertical"
+            android:padding="14dp"
+            android:visibility="visible">
+
+            <!-- Top Saved Sensors Bar (4 Sensor Slots + Sensor Settings + Connect/Disconnect) -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="44dp"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:layout_marginBottom="12dp">
+
+                <Button
+                    android:id="@+id/btn_slot_0"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:layout_marginRight="6dp"
+                    android:background="@color/accent_blue"
+                    android:text="1: + Add Sensor"
+                    android:textColor="@color/text_primary"
+                    android:textSize="13sp"
+                    android:singleLine="true"
+                    android:ellipsize="end" />
+
+                <Button
+                    android:id="@+id/btn_slot_1"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:layout_marginRight="6dp"
+                    android:background="@color/bg_button"
+                    android:text="2: + Add Sensor"
+                    android:textColor="@color/text_primary"
+                    android:textSize="13sp"
+                    android:singleLine="true"
+                    android:ellipsize="end" />
+
+                <Button
+                    android:id="@+id/btn_slot_2"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:layout_marginRight="6dp"
+                    android:background="@color/bg_button"
+                    android:text="3: + Add Sensor"
+                    android:textColor="@color/text_primary"
+                    android:textSize="13sp"
+                    android:singleLine="true"
+                    android:ellipsize="end" />
+
+                <Button
+                    android:id="@+id/btn_slot_3"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:layout_marginRight="10dp"
+                    android:background="@color/bg_button"
+                    android:text="4: + Add Sensor"
+                    android:textColor="@color/text_primary"
+                    android:textSize="13sp"
+                    android:singleLine="true"
+                    android:ellipsize="end" />
+
+                <Button
+                    android:id="@+id/btn_edit_sensor"
+                    android:layout_width="wrap_content"
+                    android:layout_height="match_parent"
+                    android:layout_marginRight="6dp"
+                    android:paddingLeft="14dp"
+                    android:paddingRight="14dp"
+                    android:background="@color/bg_button"
+                    android:text="Sensor Config"
+                    android:textColor="@color/text_primary"
+                    android:textSize="13sp" />
+
+                <Button
+                    android:id="@+id/btn_toggle_conn"
+                    android:layout_width="126dp"
+                    android:layout_height="match_parent"
+                    android:background="@color/accent_green"
+                    android:text="Connect"
+                    android:textColor="#ffffff"
+                    android:textStyle="bold"
+                    android:textSize="13sp" />
+            </LinearLayout>
+
+            <!-- Main Split Row: Left Telemetry Readout Card + Right Live Waveform Graph -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="0dp"
+                android:layout_weight="1"
+                android:orientation="horizontal">
+
+                <!-- Left Hero Readout Card -->
+                <LinearLayout
+                    android:layout_width="370dp"
+                    android:layout_height="match_parent"
+                    android:orientation="vertical"
+                    android:background="@color/bg_panel"
+                    android:padding="16dp"
+                    android:layout_marginRight="12dp">
+
+                    <TextView
+                        android:id="@+id/tv_sensor_title"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="No Sensor Configured"
+                        android:textColor="@color/text_primary"
+                        android:textSize="18sp"
+                        android:textStyle="bold"
+                        android:singleLine="true"
+                        android:ellipsize="end" />
+
+                    <TextView
+                        android:id="@+id/tv_sensor_meta"
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:layout_marginTop="2dp"
+                        android:text="Select BLE Scanner to pair a BVM02 monitor"
+                        android:textColor="@color/text_secondary"
+                        android:textSize="12sp"
+                        android:singleLine="true"
+                        android:ellipsize="end" />
+
+                    <!-- Hero Voltage Row -->
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="horizontal"
+                        android:gravity="bottom"
+                        android:layout_marginTop="14dp">
+
+                        <TextView
+                            android:id="@+id/tv_voltage_value"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:text="--.-- V"
+                            android:textColor="@color/accent_green"
+                            android:textSize="54sp"
+                            android:textStyle="bold" />
+
+                        <TextView
+                            android:id="@+id/tv_health_badge"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:layout_marginBottom="10dp"
+                            android:background="#252b36"
+                            android:paddingLeft="10dp"
+                            android:paddingRight="10dp"
+                            android:paddingTop="4dp"
+                            android:paddingBottom="4dp"
+                            android:text="STANDBY"
+                            android:textColor="@color/text_secondary"
+                            android:textSize="12sp"
+                            android:textStyle="bold" />
+                    </LinearLayout>
+
+                    <!-- State of Charge Section -->
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="horizontal"
+                        android:gravity="center_vertical"
+                        android:layout_marginTop="10dp">
+
+                        <TextView
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:text="STATE OF CHARGE (SoC)"
+                            android:textColor="@color/text_secondary"
+                            android:textSize="12sp" />
+
+                        <TextView
+                            android:id="@+id/tv_soc_value"
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="-- %"
+                            android:textColor="@color/text_primary"
+                            android:textSize="26sp"
+                            android:textStyle="bold" />
+                    </LinearLayout>
+
+                    <ProgressBar
+                        android:id="@+id/pb_soc"
+                        style="?android:attr/progressBarStyleHorizontal"
+                        android:layout_width="match_parent"
+                        android:layout_height="12dp"
+                        android:layout_marginTop="6dp"
+                        android:max="100"
+                        android:progress="0" />
+
+                    <View
+                        android:layout_width="match_parent"
+                        android:layout_height="1dp"
+                        android:layout_marginTop="14dp"
+                        android:layout_marginBottom="12dp"
+                        android:background="@color/divider" />
+
+                    <!-- Secondary Telemetry Grid (Temp, System Mode, Min/Max, Samples) -->
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="horizontal">
+
+                        <LinearLayout
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:orientation="vertical">
+
+                            <TextView
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:text="TEMPERATURE"
+                                android:textColor="@color/text_muted"
+                                android:textSize="11sp" />
+
+                            <TextView
+                                android:id="@+id/tv_temp_value"
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:layout_marginTop="2dp"
+                                android:text="-- °C"
+                                android:textColor="@color/text_primary"
+                                android:textSize="17sp"
+                                android:textStyle="bold" />
+                        </LinearLayout>
+
+                        <LinearLayout
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:orientation="vertical">
+
+                            <TextView
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:text="BATTERY SYSTEM"
+                                android:textColor="@color/text_muted"
+                                android:textSize="11sp" />
+
+                            <TextView
+                                android:id="@+id/tv_system_mode"
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:layout_marginTop="2dp"
+                                android:text="12V (Auto)"
+                                android:textColor="@color/accent_cyan"
+                                android:textSize="17sp"
+                                android:textStyle="bold" />
+                        </LinearLayout>
+                    </LinearLayout>
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="horizontal"
+                        android:layout_marginTop="12dp">
+
+                        <LinearLayout
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:orientation="vertical">
+
+                            <TextView
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:text="SESSION MIN / MAX"
+                                android:textColor="@color/text_muted"
+                                android:textSize="11sp" />
+
+                            <TextView
+                                android:id="@+id/tv_stat_minmax"
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:layout_marginTop="2dp"
+                                android:text="-- / --"
+                                android:textColor="@color/text_primary"
+                                android:textSize="15sp"
+                                android:textStyle="bold" />
+                        </LinearLayout>
+
+                        <LinearLayout
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:orientation="vertical">
+
+                            <TextView
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:text="LAST GATT READ"
+                                android:textColor="@color/text_muted"
+                                android:textSize="11sp" />
+
+                            <TextView
+                                android:id="@+id/tv_stat_updated"
+                                android:layout_width="wrap_content"
+                                android:layout_height="wrap_content"
+                                android:layout_marginTop="2dp"
+                                android:text="Waiting..."
+                                android:textColor="@color/text_secondary"
+                                android:textSize="14sp" />
+                        </LinearLayout>
+                    </LinearLayout>
+
+                    <View
+                        android:layout_width="match_parent"
+                        android:layout_height="0dp"
+                        android:layout_weight="1" />
+
+                    <TextView
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:text="@string/safety_notice"
+                        android:textColor="@color/text_muted"
+                        android:textSize="10sp" />
+                </LinearLayout>
+
+                <!-- Right Live Voltage Waveform Card -->
+                <LinearLayout
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1"
+                    android:orientation="vertical"
+                    android:background="@color/bg_panel"
+                    android:padding="14dp">
+
+                    <LinearLayout
+                        android:layout_width="match_parent"
+                        android:layout_height="wrap_content"
+                        android:orientation="horizontal"
+                        android:gravity="center_vertical"
+                        android:layout_marginBottom="8dp">
+
+                        <TextView
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
+                            android:text="LIVE VOLTAGE TRACE (IN-RAM)"
+                            android:textColor="@color/text_primary"
+                            android:textSize="14sp"
+                            android:textStyle="bold" />
+
+                        <TextView
+                            android:id="@+id/tv_chart_subtitle"
+                            android:layout_width="0dp"
+                            android:layout_height="wrap_content"
+                            android:layout_weight="1"
+                            android:layout_marginLeft="12dp"
+                            android:text="Polling UUID 0xFFF2 @ 1.5s  |  0 samples"
+                            android:textColor="@color/text_secondary"
+                            android:textSize="12sp"
+                            android:singleLine="true"
+                            android:ellipsize="end" />
+
+                        <Button
+                            android:id="@+id/btn_clear_graph"
+                            android:layout_width="wrap_content"
+                            android:layout_height="32dp"
+                            android:paddingLeft="12dp"
+                            android:paddingRight="12dp"
+                            android:background="@color/bg_button"
+                            android:text="Clear Trace"
+                            android:textColor="@color/text_secondary"
+                            android:textSize="12sp" />
+                    </LinearLayout>
+
+                    <bvm02.app.VoltageSparklineView
+                        android:id="@+id/view_sparkline"
+                        android:layout_width="match_parent"
+                        android:layout_height="0dp"
+                        android:layout_weight="1" />
+                </LinearLayout>
+            </LinearLayout>
+        </LinearLayout>
+
+        <!-- ================= 2. BLE SCANNER TAB ================= -->
+        <LinearLayout
+            android:id="@+id/layout_mode_scanner"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:orientation="vertical"
+            android:padding="14dp"
+            android:visibility="gone">
+
+            <!-- Scanner Controls Toolbar -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="44dp"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:layout_marginBottom="10dp">
+
+                <Button
+                    android:id="@+id/btn_scan_toggle"
+                    android:layout_width="150dp"
+                    android:layout_height="match_parent"
+                    android:layout_marginRight="8dp"
+                    android:background="@color/accent_blue"
+                    android:text="Start BLE Scan"
+                    android:textColor="#ffffff"
+                    android:textStyle="bold"
+                    android:textSize="13sp" />
+
+                <Button
+                    android:id="@+id/btn_scan_filter"
+                    android:layout_width="185dp"
+                    android:layout_height="match_parent"
+                    android:layout_marginRight="8dp"
+                    android:background="@color/bg_button"
+                    android:text="Filter: BVM02 Only"
+                    android:textColor="@color/accent_cyan"
+                    android:textSize="13sp" />
+
+                <Button
+                    android:id="@+id/btn_manual_mac"
+                    android:layout_width="wrap_content"
+                    android:layout_height="match_parent"
+                    android:paddingLeft="14dp"
+                    android:paddingRight="14dp"
+                    android:layout_marginRight="12dp"
+                    android:background="@color/bg_button"
+                    android:text="Add by MAC"
+                    android:textColor="@color/text_primary"
+                    android:textSize="13sp" />
+
+                <TextView
+                    android:id="@+id/tv_scan_summary"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Tap Start BLE Scan to discover nearby BVM02 monitors (API 19 startLeScan)."
+                    android:textColor="@color/text_secondary"
+                    android:textSize="13sp"
+                    android:maxLines="2"
+                    android:ellipsize="end" />
+            </LinearLayout>
+
+            <ListView
+                android:id="@+id/lv_scan_devices"
+                android:layout_width="match_parent"
+                android:layout_height="0dp"
+                android:layout_weight="1"
+                android:divider="@color/bg_dark"
+                android:dividerHeight="6dp" />
+
+            <TextView
+                android:id="@+id/tv_scan_empty"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:padding="14dp"
+                android:gravity="center"
+                android:text="Note: BVM02 is a single-connection BLE peripheral. Disconnect any phone app from the BVM02 so it advertises on BLE."
+                android:textColor="@color/text_muted"
+                android:textSize="12sp" />
+        </LinearLayout>
+
+        <!-- ================= 3. BT DIAGNOSTICS TAB ================= -->
+        <LinearLayout
+            android:id="@+id/layout_mode_diag"
+            android:layout_width="match_parent"
+            android:layout_height="match_parent"
+            android:orientation="vertical"
+            android:padding="14dp"
+            android:visibility="gone">
+
+            <!-- Hardware Capability & Coexistence Header -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical"
+                android:background="@color/bg_panel"
+                android:padding="12dp"
+                android:layout_marginBottom="10dp">
+
+                <TextView
+                    android:id="@+id/tv_bt_hw_summary"
+                    android:layout_width="0dp"
+                    android:layout_height="wrap_content"
+                    android:layout_weight="1"
+                    android:text="Inspecting Gen5W Bluetooth hardware..."
+                    android:textColor="@color/accent_cyan"
+                    android:typeface="monospace"
+                    android:textSize="12sp" />
+
+                <Button
+                    android:id="@+id/btn_refresh_bt_info"
+                    android:layout_width="wrap_content"
+                    android:layout_height="38dp"
+                    android:layout_marginLeft="8dp"
+                    android:paddingLeft="12dp"
+                    android:paddingRight="12dp"
+                    android:background="@color/bg_button"
+                    android:text="Probe BT Stack"
+                    android:textColor="@color/text_primary"
+                    android:textSize="12sp" />
+
+                <Button
+                    android:id="@+id/btn_diag_export"
+                    android:layout_width="wrap_content"
+                    android:layout_height="38dp"
+                    android:layout_marginLeft="8dp"
+                    android:paddingLeft="12dp"
+                    android:paddingRight="12dp"
+                    android:background="#2e4057"
+                    android:text="Export Log + CSV to USB"
+                    android:textColor="@color/accent_gold"
+                    android:textStyle="bold"
+                    android:textSize="12sp" />
+
+                <Button
+                    android:id="@+id/btn_diag_clear"
+                    android:layout_width="wrap_content"
+                    android:layout_height="38dp"
+                    android:layout_marginLeft="8dp"
+                    android:paddingLeft="12dp"
+                    android:paddingRight="12dp"
+                    android:background="@color/bg_button"
+                    android:text="Clear Log"
+                    android:textColor="@color/text_secondary"
+                    android:textSize="12sp" />
+            </LinearLayout>
+
+            <!-- Scrollable RAM-only Diagnostic Log -->
+            <ScrollView
+                android:id="@+id/sv_diag_log"
+                android:layout_width="match_parent"
+                android:layout_height="0dp"
+                android:layout_weight="1"
+                android:background="#0d0f13"
+                android:padding="12dp">
+
+                <TextView
+                    android:id="@+id/tv_diag_console"
+                    android:layout_width="match_parent"
+                    android:layout_height="wrap_content"
+                    android:text="RAM Diagnostic Ring Buffer Initialized (Zero eMMC Flash Writes).\n"
+                    android:textColor="#d5dde8"
+                    android:typeface="monospace"
+                    android:textSize="12sp" />
+            </ScrollView>
+        </LinearLayout>
+    </FrameLayout>
+</LinearLayout>

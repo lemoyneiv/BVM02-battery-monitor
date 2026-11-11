@@ -111,51 +111,70 @@ public final class HmgapidClient {
     }
 
     /**
-     * Triggers a manual one-shot mod service via hmgapid, waits until its state is no longer
-     * running/waiting (up to maxWaitMs), and returns its captured service-log output.
+     * Triggers a manual one-shot mod service via hmgapid, waits across hmgapid's 1-second
+     * supervisor tick until a newly completed run marker appears in service-log (up to maxWaitMs),
+     * and returns only the latest run's output.
      */
     public static String runManualServiceAndReadLog(String serviceName, int maxWaitMs) {
         Result ping = callResult(false, "ping");
         if (ping.code != 0) {
             return null;
         }
-        Result start = callResult(false, "service-restart", serviceName);
+
+        final String beginMarker = "=== BEGIN BTPROBE ROOT READ-ONLY SNAPSHOT";
+        final String endMarker = "=== END BTPROBE ROOT READ-ONLY SNAPSHOT ===";
+
+        Result preLog = callResult(false, "service-log", serviceName);
+        int priorEnds = (preLog.code == 0) ? countOccurrences(preLog.text, endMarker) : 0;
+        int priorLen = (preLog.code == 0 && preLog.text != null) ? preLog.text.length() : 0;
+
+        Result start = callResult(false, "service-start", serviceName);
         if (start.code != 0) {
-            start = callResult(false, "service-start", serviceName);
+            start = callResult(false, "service-restart", serviceName);
             if (start.code != 0) {
                 return "SERVICE_START_ERR: code=" + start.code + " msg=" + start.text.trim();
             }
         }
 
-        long deadline = System.currentTimeMillis() + Math.max(300, maxWaitMs);
+        long deadline = System.currentTimeMillis() + Math.max(1500, maxWaitMs);
+        Result lastLog = null;
         while (System.currentTimeMillis() < deadline) {
-            try { Thread.sleep(150); } catch (InterruptedException ie) { break; }
-            Result svcs = callResult(false, "services");
-            if (svcs.code == 0 && svcs.text != null) {
-                boolean stillRunning = false;
-                boolean matched = false;
-                String[] lines = svcs.text.split("\n");
-                for (int i = 0; i < lines.length; i++) {
-                    String[] parts = lines[i].trim().split("\\s+");
-                    if (parts.length >= 3 && serviceName.equals(parts[1])) {
-                        matched = true;
-                        String st = parts[2];
-                        if ("running".equals(st) || "waiting".equals(st)) {
-                            stillRunning = true;
-                        }
-                    }
-                }
-                if (matched && !stillRunning) {
-                    break;
+            try { Thread.sleep(250); } catch (InterruptedException ie) { break; }
+            lastLog = callResult(false, "service-log", serviceName);
+            if (lastLog.code == 0 && lastLog.text != null) {
+                int nowEnds = countOccurrences(lastLog.text, endMarker);
+                if (nowEnds > priorEnds || (priorEnds > 0 && lastLog.text.length() != priorLen && lastLog.text.endsWith(endMarker + "\n"))) {
+                    return extractLatestRunSlice(lastLog.text, beginMarker);
                 }
             }
         }
 
-        Result logRes = callResult(false, "service-log", serviceName);
-        if (logRes.code != 0) {
-            return "SERVICE_LOG_ERR: code=" + logRes.code + " msg=" + logRes.text.trim();
+        if (lastLog == null) {
+            lastLog = callResult(false, "service-log", serviceName);
         }
-        return logRes.text;
+        if (lastLog.code == 0 && lastLog.text != null && !lastLog.text.trim().isEmpty()) {
+            return extractLatestRunSlice(lastLog.text, beginMarker);
+        }
+        Result svcs = callResult(false, "services");
+        String svcState = (svcs.code == 0 && svcs.text != null) ? svcs.text.trim().replace('\n', ';') : ("err=" + svcs.code);
+        return "SERVICE_LOG_ERR: code=" + lastLog.code + " msg=" + lastLog.text.trim() + " [services=" + svcState + "]";
+    }
+
+    public static int countOccurrences(String haystack, String needle) {
+        if (haystack == null || needle == null || needle.isEmpty()) return 0;
+        int count = 0;
+        int idx = 0;
+        while ((idx = haystack.indexOf(needle, idx)) >= 0) {
+            count++;
+            idx += needle.length();
+        }
+        return count;
+    }
+
+    public static String extractLatestRunSlice(String fullLog, String beginMarker) {
+        if (fullLog == null || beginMarker == null || beginMarker.isEmpty()) return fullLog;
+        int lastBegin = fullLog.lastIndexOf(beginMarker);
+        return (lastBegin >= 0) ? fullLog.substring(lastBegin) : fullLog;
     }
 
     private static void u32(ByteArrayOutputStream o, int v) {

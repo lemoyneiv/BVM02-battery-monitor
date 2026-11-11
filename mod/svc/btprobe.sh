@@ -1,8 +1,9 @@
 #!/system/bin/sh
-# Strictly read-only, passive Gen5W Bluetooth HAL & process map inspector (v0.1.4).
+# Strictly read-only, passive Gen5W Bluetooth HAL & process map inspector (v0.1.5).
 # Zero writes to /system, /data, or USB; zero /data or PII/VIN/serial reads.
 
-echo "=== BEGIN BTPROBE ROOT READ-ONLY SNAPSHOT ==="
+run_ts="$(date +%s 2>/dev/null)"
+echo "=== BEGIN BTPROBE ROOT READ-ONLY SNAPSHOT (ts=$run_ts) ==="
 
 btpid=""
 for p in /proc/[0-9]*; do

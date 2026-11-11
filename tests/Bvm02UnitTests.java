@@ -1,5 +1,6 @@
 import bvm02.app.BtStackProbe;
 import bvm02.app.Bvm02Protocol;
+import bvm02.app.HmgapidClient;
 import bvm02.app.ScreenshotHelper;
 import bvm02.app.SensorConfig;
 
@@ -14,7 +15,7 @@ import java.util.List;
 /**
  * Host JVM unit test suite for BVM02 protocol framing, BLE scanRecord parsing,
  * 20-byte ATT multi-chunk reassembly, 12V/24V SoC curves, MAC validation, Telechips BGRA fix,
- * passive ELF32 .dynsym / DT_NEEDED symbol parsing, and in-RAM Dalvik DEX / ODEX introspection.
+ * passive ELF32 .dynsym / DT_NEEDED / PT_LOAD parsing, hmgapid log slicing, and in-RAM DEX introspection.
  */
 public final class Bvm02UnitTests {
 
@@ -52,6 +53,7 @@ public final class Bvm02UnitTests {
         testSensorConfigValidation();
         testTelechipsBgraSwapDetector();
         testElf32SymbolParserAndMacRedaction();
+        testHmgapidLogSlicing();
         testInRamDexInventoryParser(args.length > 0 ? args[0] : "build/dex/classes.dex");
 
         System.out.println("  [OK] Bvm02UnitTests passed all " + passed + " assertions.");
@@ -433,16 +435,29 @@ public final class Bvm02UnitTests {
         b.putShort(16, (short) 3);   // ET_DYN
         b.putShort(18, (short) 40);  // EM_ARM
         b.putInt(20, 1);             // e_version
+        b.putInt(28, 704);           // e_phoff (1 PT_LOAD header x 32B = 32B at 704..736)
         b.putInt(32, 448);           // e_shoff
         b.putShort(40, (short) 52);  // e_ehsize
+        b.putShort(42, (short) 32);  // e_phentsize
+        b.putShort(44, (short) 1);   // e_phnum
         b.putShort(46, (short) 40);  // e_shentsize
         b.putShort(48, (short) 6);   // e_shnum
         b.putShort(50, (short) 5);   // e_shstrndx
+
+        // Program header [0] PT_LOAD at 704: p_vaddr = 0x10000 -> p_offset = 0, p_filesz = 768
+        b.putInt(704, 1);            // PT_LOAD
+        b.putInt(708, 0);            // p_offset = 0
+        b.putInt(712, 0x00010000);   // p_vaddr = 0x10000
+        b.putInt(716, 0x00010000);   // p_paddr
+        b.putInt(720, 768);          // p_filesz
+        b.putInt(724, 768);          // p_memsz
 
         // Copy .dynstr at 64, .dynamic at 160, .dynsym at 192, .rodata at 272, .shstrtab at 368
         System.arraycopy(dynstrBytes, 0, elf, 64, dynstrBytes.length);
         System.arraycopy(rodataBytes, 0, elf, 272, rodataBytes.length);
         System.arraycopy(shstrBytes, 0, elf, 368, shstrBytes.length);
+        // Write a known uint32 at file offset 352 (vaddr 0x10000 + 352 = 0x10160)
+        b.putInt(352, 0x48574D54); // 'HWMT'
 
         // .dynamic at 160 (3 entries x 8B = 24B)
         b.putInt(160, 1); b.putInt(164, 1);  // DT_NEEDED -> "libc.so"
@@ -451,13 +466,13 @@ public final class Bvm02UnitTests {
 
         // .dynsym at 192 (4 entries x 16B = 64B)
         b.putInt(208, 24);
-        b.putInt(212, 0x00001200);
+        b.putInt(212, 0x00010111); // Thumb function bit set (vaddr 0x10110 | 1)
         b.putInt(216, 48);
         elf[220] = (byte) ((1 << 4) | 2);
         b.putShort(222, (short) 1);
 
         b.putInt(224, 43);
-        b.putInt(228, 0x00001400);
+        b.putInt(228, 0x00010120); // ARM function (even vaddr)
         b.putInt(232, 64);
         elf[236] = (byte) ((1 << 4) | 2);
         b.putShort(238, (short) 1);
@@ -521,6 +536,22 @@ public final class Bvm02UnitTests {
         assertEqualsStr("export[0]", "tcc_bt_client_init", exports.get(0));
         assertEqualsStr("export[1]", "tcc_bt_gatt_scan_start", exports.get(1));
 
+        BtStackProbe.ElfSym initSym = info.exportedSymMap.get("tcc_bt_client_init");
+        assertTrue("exportedSymMap contains tcc_bt_client_init", initSym != null);
+        assertTrue("tcc_bt_client_init is Thumb func", initSym.isThumbFunc());
+        assertEquals("tcc_bt_client_init cleanVaddr", 0x00010110, (int) initSym.cleanVaddr());
+        assertEquals("tcc_bt_client_init stSize", 48, (int) initSym.stSize);
+
+        BtStackProbe.ElfSym scanSym = info.exportedSymMap.get("tcc_bt_gatt_scan_start");
+        assertTrue("tcc_bt_gatt_scan_start is ARM func", scanSym != null && !scanSym.isThumbFunc());
+
+        // PT_LOAD vaddr -> file offset resolution
+        assertEquals("PT_LOAD count", 1, info.loadSegments.size());
+        assertEquals("vaddrToFileOffset(0x10110) -> 272", 272, info.vaddrToFileOffset(0x00010110L, elf.length));
+        assertEquals("unmapped vaddr -> -1", -1, info.vaddrToFileOffset(0x00900000L, elf.length));
+        assertEqualsStr("readCStringAtVaddr(0x10110)", "/dev/tcc_bt_dev", info.readCStringAtVaddr(elf, 0x00010110L));
+        assertEquals("readUint32AtVaddr(0x10160)", 0x48574D54, (int) info.readUint32AtVaddr(elf, 0x00010160L));
+
         assertEquals("imported symbol count", 1, info.importedSymbols.size());
         assertEqualsStr("import[0]", "ioctl", info.importedSymbols.get(0));
 
@@ -535,5 +566,19 @@ public final class Bvm02UnitTests {
         elf64[4] = 2; // ELFCLASS64
         assertTrue("ELF64 rejected cleanly", BtStackProbe.extractElf32Info(elf64) == null);
         assertEquals("short ELF dynamic symbols empty", 0, BtStackProbe.extractElf32DynamicSymbols(new byte[8]).size());
+    }
+
+    private static void testHmgapidLogSlicing() {
+        String begin = "=== BEGIN BTPROBE ROOT READ-ONLY SNAPSHOT";
+        String end = "=== END BTPROBE ROOT READ-ONLY SNAPSHOT ===";
+        String twoRuns = begin + " (ts=1000) ===\nBT_PID: 1641\n" + end + "\n"
+                + begin + " (ts=1005) ===\nBT_PID: 1641\nBTMAP: /system/lib/hw/bplus.default.so\n" + end + "\n";
+
+        assertEquals("countOccurrences end markers", 2, HmgapidClient.countOccurrences(twoRuns, end));
+        assertEquals("countOccurrences empty needle", 0, HmgapidClient.countOccurrences(twoRuns, ""));
+        String latest = HmgapidClient.extractLatestRunSlice(twoRuns, begin);
+        assertTrue("latest slice starts with ts=1005", latest.startsWith(begin + " (ts=1005)"));
+        assertTrue("latest slice includes bplus.default.so", latest.contains("bplus.default.so"));
+        assertTrue("latest slice omits ts=1000", !latest.contains("ts=1000"));
     }
 }

@@ -291,6 +291,7 @@ def test_distribution_archives_and_hmg_signature() -> None:
         required = {
             "mod.json",
             "open.sh",
+            "svc/btprobe.sh",
             "svc/screenshot.sh",
             "svc/reboot.sh",
             "icons/tile.png",

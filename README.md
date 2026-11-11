@@ -14,13 +14,13 @@ The LNEX BVM02 battery monitor's original companion Android app (`BatterySense` 
 
 ---
 
-## Current Scope — `v0.1.3` Hardware Proof-of-Concept
+## Current Scope — `v0.1.4` Hardware Proof-of-Concept
 
 * **24:9 Automotive Widescreen UI:** Left driver-side navigation sidebar, high-contrast dark theme, and large touch targets tailored for `1920x720` Gen5W screens.
 * **Safe API 19 BLE Scanner, `system_server` Guard & Passive Telechips `mbox` Stack Probe:**
-  * Uses strictly standard public Android 4.4 API 19 BLE/GATT APIs (`startLeScan`, `connectGatt`), never invoking hidden `@hide` `IBluetoothManager` or leftover `com.broadcom.bt.*` Binder calls that can fault `system_server` on Telechips `tcc.solution.bluetooth.mbox=1` firmware where `GattService` is absent.
-  * Automatically checks `getBluetoothGatt()` before scanning or connecting so missing firmware GATT services are reported cleanly with zero `system_server` impact.
-  * Includes an on-demand, strictly passive **`BtStackProbe`** (`BT Diagnostics` -> `Probe BT Stack`) that inspects `/system/lib/libbt-client-api.so` and `/system/lib/libbluetooth_jni.so` ELF32 `.dynsym`/`DT_NEEDED` symbol tables via pure `FileInputStream` (zero `dlopen`), `Bluetooth.apk` DEX/ODEX inventory, `/dev` mailbox/BT/USB nodes, and `/sys/bus/usb/devices`.
+  * Uses strictly standard public Android 4.4 API 19 BLE/GATT APIs (`startLeScan`, `connectGatt`), never invoking hidden `@hide` `IBluetoothManager` (`enableGatt`, `enableRadio`) or leftover `com.broadcom.bt.*` Binder calls that can fault `system_server` on Telechips `tcc.solution.bluetooth.mbox=1` firmware where `GattService` is manifest-disabled.
+  * Automatically checks `getBluetoothGatt()` before scanning or connecting so unavailable firmware GATT services are reported cleanly with zero `system_server` impact.
+  * Includes an on-demand, strictly passive **`BtStackProbe`** (`BT Diagnostics` -> `Probe BT Stack`) that captures `com.android.bluetooth`'s loaded libraries and open `/dev` fds via HMG-API (`svc/btprobe.sh`), inspects `libbluetooth_jni.so` and mapped HAL ELF32 `.dynsym`/`.rodata` tables via pure `FileInputStream` (zero `dlopen`), disassembles `Bluetooth.odex` / `services.odex` GATT/HAL control flow, and inventories `/vendor/lib/hw` and `/dev` mailbox/BT/USB nodes.
   * Supports **`Add by MAC`** (`AA:BB:CC:DD:EE:FF`) to directly connect to a known BVM02 address when `IBluetoothGatt` is available.
 * **Live Battery Telemetry (`UUID 0xFFF2` @ 1.5s):**
   * Real-time terminal voltage (`0.01 V` precision), piecewise-linear **State-of-Charge (`0–100%`)**, sensor temperature (`°C / °F`), `12V / 24V` auto-detection or manual override, session `Min / Max`, and an allocation-free rolling voltage sparkline trace.
@@ -47,10 +47,10 @@ Build artifacts are generated in `dist/` in four formats:
 
 | Package Archive | Target Environment |
 | :--- | :--- |
-| `bvm02-gen5w-v0.1.3-hmgapi-usb.zip` | **HMG-API Auto-Installer:** Extract directly onto the root of a FAT32 USB flash drive (`HMGAPI/updates/bvm02-gen5w-v0.1.3.zip`) and insert into the vehicle's data USB port. |
-| `bvm02-gen5w-v0.1.3.hmgapi.zip` | **HMG-API Mod Archive:** Direct `.hmgapi.zip` package signed with ECDSA P-256 (`META-HMGAPI/signature`). |
-| `bvm02-gen5w-v0.1.3-nemesis-usb.zip` | **NEMESIS USB Sideload:** Extract onto a FAT32 USB drive (`nemesis/apps/...`) for NEMESIS Manager installation. |
-| `bvm02-gen5w-v0.1.3-nemesis-package.zip` | **NEMESIS Store Repository Package.** |
+| `bvm02-gen5w-v0.1.4-hmgapi-usb.zip` | **HMG-API Auto-Installer:** Extract directly onto the root of a FAT32 USB flash drive (`HMGAPI/updates/bvm02-gen5w-v0.1.4.zip`) and insert into the vehicle's data USB port. |
+| `bvm02-gen5w-v0.1.4.hmgapi.zip` | **HMG-API Mod Archive:** Direct `.hmgapi.zip` package signed with ECDSA P-256 (`META-HMGAPI/signature`). |
+| `bvm02-gen5w-v0.1.4-nemesis-usb.zip` | **NEMESIS USB Sideload:** Extract onto a FAT32 USB drive (`nemesis/apps/...`) for NEMESIS Manager installation. |
+| `bvm02-gen5w-v0.1.4-nemesis-package.zip` | **NEMESIS Store Repository Package.** |
 
 ### Manual ADB Install (Bench / Engineering Mode)
 

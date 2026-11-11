@@ -72,7 +72,7 @@ public final class DiagLogger {
     private static volatile LogListener listener;
 
     static {
-        log("INIT", "BVM02 Battery Monitor v0.1.3 initialized (SDK=" + Build.VERSION.SDK_INT
+        log("INIT", "BVM02 Battery Monitor v0.1.4 initialized (SDK=" + Build.VERSION.SDK_INT
                 + ", Release=" + Build.VERSION.RELEASE
                 + ", Model=" + Build.MODEL
                 + ", Product=" + Build.PRODUCT

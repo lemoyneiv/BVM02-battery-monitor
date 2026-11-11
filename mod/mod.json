@@ -1,7 +1,7 @@
 {
   "id": "bvm02-gen5w",
   "name": "BVM02 Battery Monitor",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "hmgapi": ">=1.0.0",
   "authors": ["lemoyneiv"],
   "license": "AGPL-3.0",
@@ -21,6 +21,13 @@
     {
       "name": "screenshot",
       "script": "svc/screenshot.sh",
+      "user": "root",
+      "start": "manual",
+      "restart": false
+    },
+    {
+      "name": "btprobe",
+      "script": "svc/btprobe.sh",
       "user": "root",
       "start": "manual",
       "restart": false

@@ -26,31 +26,34 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.Comparator;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
 /**
- * Strictly passive, read-only, in-RAM Gen5W Bluetooth & Telechips mbox stack introspector (v0.1.3).
+ * Strictly passive, read-only, in-RAM Gen5W Bluetooth, HAL, DEX bytecode & ELF32 stack introspector (v0.1.4).
  *
  * SAFETY INVARIANTS (Gen5W Telechips TCC803x tcc.solution.bluetooth.mbox=1):
  *  - NEVER invokes @hide Binder IPC methods on system_server (never calls enableGatt, enableRadio,
  *    disableRadio, isRadioEnabled, or registerRadioMgrCallback).
+ *  - NEVER enables or binds disabled components (com.android.bluetooth/.gatt.GattService).
  *  - NEVER loads or initializes com.broadcom.bt.* classes via Class.forName.
- *  - NEVER calls dlopen / System.loadLibrary on native .so files; inspects ELF32 .dynsym & .dynamic
- *    tables strictly via pure-Java FileInputStream byte parsing in RAM.
- *  - NEVER opens /dev character devices; lists /dev node names and /sys/bus/usb attributes passively.
- *  - Zero root required, zero writes to internal /data eMMC flash, and zero PII/VIN/serial collection.
+ *  - NEVER calls dlopen / System.loadLibrary on native .so files; inspects ELF32 .dynsym, .dynamic,
+ *    and .rodata tables strictly via pure-Java FileInputStream byte parsing in RAM.
+ *  - NEVER opens /dev character devices; lists /dev node names, /proc/<bt_pid>/maps, and /sys/bus/usb passively.
+ *  - Zero writes to /system or internal /data eMMC flash, and zero PII/VIN/serial collection.
  */
 public final class BtStackProbe {
 
     private static final Charset UTF8 = Charset.forName("UTF-8");
     private static final int MAX_DEX_BYTES = 16 * 1024 * 1024;
-    private static final int MAX_ELF_BYTES = 2 * 1024 * 1024;
+    private static final int MAX_ELF_BYTES = 4 * 1024 * 1024;
     private static final AtomicBoolean PROBE_RUNNING = new AtomicBoolean(false);
 
     public static final class DexClassEntry {
@@ -79,18 +82,40 @@ public final class BtStackProbe {
         }
     }
 
+    public static final class DexMethodTrace {
+        public final String className;
+        public final String methodSignature;
+        public final int insnsUnits;
+        public final List<String> ops;
+
+        public DexMethodTrace(String className, String methodSignature, int insnsUnits, List<String> ops) {
+            this.className = className;
+            this.methodSignature = methodSignature;
+            this.insnsUnits = insnsUnits;
+            this.ops = ops;
+        }
+    }
+
     public static final class Elf32Info {
         public final int machine;
         public final List<String> neededLibs;
         public final List<String> exportedSymbols;
         public final List<String> importedSymbols;
+        public final List<String> rodataStrings;
 
         public Elf32Info(int machine, List<String> neededLibs,
                          List<String> exportedSymbols, List<String> importedSymbols) {
+            this(machine, neededLibs, exportedSymbols, importedSymbols, Collections.<String>emptyList());
+        }
+
+        public Elf32Info(int machine, List<String> neededLibs,
+                         List<String> exportedSymbols, List<String> importedSymbols,
+                         List<String> rodataStrings) {
             this.machine = machine;
             this.neededLibs = neededLibs;
             this.exportedSymbols = exportedSymbols;
             this.importedSymbols = importedSymbols;
+            this.rodataStrings = rodataStrings;
         }
     }
 
@@ -206,7 +231,7 @@ public final class BtStackProbe {
     }
 
     /**
-     * Runs the strictly passive Gen5W Bluetooth, DEX & ELF32 stack probe on a background thread.
+     * Runs the strictly passive Gen5W Bluetooth, HAL, DEX bytecode & ELF32 stack probe on a background thread.
      */
     public static void runAsyncProbe(final Context context, final Runnable onCompleteCallback) {
         if (context == null) return;
@@ -235,7 +260,7 @@ public final class BtStackProbe {
     }
 
     private static void runProbeInternal(Context ctx) {
-        DiagLogger.log("BT_PROBE", "=== BEGIN PASSIVE GEN5W BLUETOOTH & ELF32 STACK PROBE (v0.1.3) ===");
+        DiagLogger.log("BT_PROBE", "=== BEGIN PASSIVE GEN5W BLUETOOTH HAL, DEX & ELF32 STACK PROBE (v0.1.4) ===");
 
         BluetoothAdapter adapter = null;
         try {
@@ -244,9 +269,12 @@ public final class BtStackProbe {
             DiagLogger.log("BT_PROBE", "getDefaultAdapter threw: " + t);
         }
 
-        // 1. Passive AIDL method signature reflection (zero hidden Binder IPC calls)
-        DiagLogger.log("BT_PROBE", "[1/7] Adapter Binder Handles: " + checkIBluetoothGattStatus(adapter));
-        probeAdapterAndAidlInterfaces(adapter);
+        // 1. Passive Binder handle status check (zero hidden Binder IPC calls)
+        DiagLogger.log("BT_PROBE", "[1/8] Adapter Binder Handles: " + checkIBluetoothGattStatus(adapter));
+        Object liveGatt = getLiveIBluetoothGatt(adapter);
+        if (liveGatt != null) {
+            DiagLogger.log("BT_PROBE", "  Live IBluetoothGatt binder present: " + describeBinderOwner(liveGatt));
+        }
 
         // 2. System shared libraries & Binder ServiceManager inventory
         probeSharedLibrariesAndBinderServices(ctx);
@@ -254,35 +282,22 @@ public final class BtStackProbe {
         // 3. Installed Bluetooth packages (including GET_DISABLED_COMPONENTS) & GattService state
         probeInstalledBtPackages(ctx);
 
-        // 4. /system/app/Bluetooth.apk boolean config table & complete DEX/ODEX class + native method inventory
+        // 4. Optional HMG-API read-only root snapshot (/proc/<bt_pid>/maps, /proc/<bt_pid>/fd, HAL dirs, init.*.rc)
+        Set<String> mappedSoPaths = probeRootProcessMapsAndHal();
+
+        // 5. /system/app/Bluetooth.apk boolean config table & targeted Dalvik bytecode X-ray (Config, AdapterService, GattService)
         probeBluetoothApkResourcesAndDex(ctx);
 
-        // 5. Targeted /system/framework/services.jar (.odex) BluetoothManagerService passive DEX read
+        // 6. /system/framework/services.jar (.odex) BluetoothManagerService Dalvik bytecode X-ray
         probeFrameworkBtAndServicesDex();
 
-        // 6. Pure FileInputStream ELF32 .dynsym & DT_NEEDED symbol table inspection of libbt-client-api.so & libbluetooth_jni.so
-        probeNativeBtElfLibraries();
+        // 7. Deep passive ELF32 .dynsym, DT_NEEDED & .rodata string inspection of libbluetooth_jni.so & all HAL/mapped .so
+        probeNativeBtElfLibraries(mappedSoPaths);
 
-        // 7. Read-only /system/etc/bluetooth configs, /dev mbox/bt/usb node listing, USB sysfs, props & processes
+        // 8. Unfiltered HAL directories, /dev nodes, USB sysfs, props & processes
         probeSystemFilesAndDaemons();
 
-        DiagLogger.log("BT_PROBE", "=== END PASSIVE GEN5W BLUETOOTH & ELF32 STACK PROBE (v0.1.3) ===");
-    }
-
-    private static void probeAdapterAndAidlInterfaces(BluetoothAdapter adapter) {
-        if (adapter == null) return;
-        Object mgr = getIBluetoothManager(adapter);
-        if (mgr != null) {
-            dumpInterfaceMethods("IBluetoothManager", mgr.getClass());
-        }
-        Object svc = getIBluetoothService(adapter);
-        if (svc != null) {
-            dumpInterfaceMethods("IBluetooth", svc.getClass());
-        }
-        Object liveGatt = getLiveIBluetoothGatt(adapter);
-        if (liveGatt != null) {
-            DiagLogger.log("BT_PROBE", "  Live IBluetoothGatt binder present: " + describeBinderOwner(liveGatt));
-        }
+        DiagLogger.log("BT_PROBE", "=== END PASSIVE GEN5W BLUETOOTH HAL, DEX & ELF32 STACK PROBE (v0.1.4) ===");
     }
 
     private static void probeSharedLibrariesAndBinderServices(Context ctx) {
@@ -296,7 +311,7 @@ public final class BtStackProbe {
                     if (i > 0) sb.append(", ");
                     sb.append(libs[i]);
                 }
-                DiagLogger.log("BT_PROBE", "[2/7] System Shared Libraries (" + libs.length + "): " + sb);
+                DiagLogger.log("BT_PROBE", "[2/8] System Shared Libraries (" + libs.length + "): " + sb);
             }
         } catch (Throwable t) {
             DiagLogger.log("BT_PROBE", "getSystemSharedLibraryNames err: " + t.getMessage());
@@ -344,7 +359,7 @@ public final class BtStackProbe {
             int flags = PackageManager.GET_SERVICES | PackageManager.GET_DISABLED_COMPONENTS;
             List<PackageInfo> pkgs = pm.getInstalledPackages(flags);
             if (pkgs == null) return;
-            DiagLogger.log("BT_PROBE", "[3/7] Installed BT packages (with GET_DISABLED_COMPONENTS):");
+            DiagLogger.log("BT_PROBE", "[3/8] Installed BT packages (with GET_DISABLED_COMPONENTS):");
             for (int i = 0; i < pkgs.size(); i++) {
                 PackageInfo pi = pkgs.get(i);
                 if (pi == null || pi.packageName == null) continue;
@@ -369,7 +384,6 @@ public final class BtStackProbe {
                         + (svcSb.length() > 0 ? (" services=[" + svcSb + "]") : " services=[]"));
             }
 
-            // Explicitly query ComponentEnabledSetting for GattService candidates
             String[] gattCandidates = {
                 "com.android.bluetooth.gatt.GattService",
                 "com.broadcom.bt.service.gatt.GattService"
@@ -390,8 +404,39 @@ public final class BtStackProbe {
         }
     }
 
+    private static Set<String> probeRootProcessMapsAndHal() {
+        DiagLogger.log("BT_PROBE", "[4/8] HMG-API read-only btprobe snapshot (/proc/<bt_pid>/maps, open fds, init.*.rc):");
+        Set<String> mappedSoPaths = new LinkedHashSet<String>();
+        try {
+            String out = HmgapidClient.runManualServiceAndReadLog("btprobe", 3500);
+            if (out == null || out.trim().isEmpty()) {
+                DiagLogger.log("BT_ROOT", "  hmgapid btprobe service unavailable or empty (continuing with in-app HAL/ELF32/DEX X-ray)");
+                return mappedSoPaths;
+            }
+            String[] lines = out.split("\n");
+            for (int i = 0; i < lines.length; i++) {
+                String line = lines[i].replace("\r", "").trim();
+                if (line.isEmpty()) continue;
+                String low = line.toLowerCase(Locale.US);
+                if (containsAny(low, new String[]{"serial", "vin", "token", "account", "passwd", "password"})) {
+                    continue;
+                }
+                DiagLogger.log("BT_ROOT", "  " + redactMacOctets(line));
+                if (line.startsWith("BTMAP:") && line.endsWith(".so")) {
+                    int slash = line.indexOf('/');
+                    if (slash >= 0) {
+                        mappedSoPaths.add(line.substring(slash).trim());
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            DiagLogger.log("BT_ROOT", "  btprobe snapshot err: " + t.getMessage());
+        }
+        return mappedSoPaths;
+    }
+
     private static void probeBluetoothApkResourcesAndDex(Context ctx) {
-        DiagLogger.log("BT_PROBE", "[4/7] Inspecting com.android.bluetooth resources & DEX/ODEX:");
+        DiagLogger.log("BT_PROBE", "[5/8] Inspecting com.android.bluetooth resources & targeted Dalvik bytecode:");
         String btApkPath = "/system/app/Bluetooth.apk";
         try {
             PackageInfo pi = ctx.getPackageManager().getPackageInfo("com.android.bluetooth", 0);
@@ -400,7 +445,7 @@ public final class BtStackProbe {
             }
         } catch (Throwable ignored) {}
 
-        // 4A. Read all <bool> config entries from com.android.bluetooth (e.g. profile_supported_gatt)
+        Map<Integer, String> resIdMap = new HashMap<Integer, String>();
         try {
             Context btCtx = ctx.createPackageContext("com.android.bluetooth", 0);
             Resources res = btCtx.getResources();
@@ -422,8 +467,9 @@ public final class BtStackProbe {
                     try {
                         String entryName = res.getResourceEntryName(id);
                         boolean val = res.getBoolean(id);
+                        resIdMap.put(Integer.valueOf(id), entryName + "=" + val);
                         if (boolSb.length() > 0) boolSb.append(", ");
-                        boolSb.append(entryName).append('=').append(val);
+                        boolSb.append(String.format(Locale.US, "%s(0x%08x)=%s", entryName, Integer.valueOf(id), String.valueOf(val)));
                         foundCount++;
                     } catch (Throwable endOfEntries) {
                         break;
@@ -434,64 +480,103 @@ public final class BtStackProbe {
 
             if (foundCount > 0) {
                 DiagLogger.log("BT_PROBE", "  Bluetooth.apk <bool> configs (" + foundCount + "): " + boolSb);
-            } else {
-                // Fallback direct identifier lookup
-                String[] keys = {
-                    "profile_supported_gatt", "profile_supported_bt_le", "profile_supported_a2dp",
-                    "profile_supported_hs_hfp", "profile_supported_hid", "profile_supported_map"
-                };
-                for (int i = 0; i < keys.length; i++) {
-                    int id = res.getIdentifier(keys[i], "bool", "com.android.bluetooth");
-                    if (id != 0) {
-                        DiagLogger.log("BT_PROBE", "  Bluetooth.apk bool " + keys[i] + "=" + res.getBoolean(id));
-                    } else {
-                        DiagLogger.log("BT_PROBE", "  Bluetooth.apk bool " + keys[i] + "=<not defined>");
-                    }
-                }
             }
         } catch (Throwable t) {
             DiagLogger.log("BT_PROBE", "  Bluetooth.apk resource read err: " + t);
         }
 
-        // 4B. Inspect /system/app/Bluetooth.apk (or Bluetooth.odex) in RAM
         File apkFile = new File(btApkPath);
         byte[] btDex = loadDexOrOdexBytes(apkFile);
         if (btDex != null) {
-            logTargetedDexInventory(apkFile.getName(), btDex, null,
-                    new String[]{"gatt", "adapterservice", "btservice", "tcc", "mbox", "blescan"},
-                    true);
-            logMatchingDexStrings(apkFile.getName(), btDex,
-                    new String[]{"gatt", "tcc", "mbox", "profile_supported", "ibluetoothgatt", "blescan", "client-api"});
+            List<DexMethodTrace> traces = extractDexMethodTraces(
+                    btDex,
+                    new String[]{
+                            "com.android.bluetooth.btservice.config",
+                            "com.android.bluetooth.btservice.adapterservice",
+                            "com.android.bluetooth.gatt.gattservice"
+                    },
+                    new String[]{
+                            "<clinit>", "init", "getsupportedprofiles",
+                            "oncreate", "processstart", "setprofileservicestate",
+                            "isprofileallowed", "setprofilestate",
+                            "start", "stop", "cleanup", "initbinder",
+                            "enforceprivilegedpermission", "registerclient",
+                            "startscan", "startscanwithuuids", "clientconnect"
+                    },
+                    resIdMap);
+            logMethodTraces("Bluetooth.odex", traces);
         } else {
             DiagLogger.log("BT_DEX", "  Could not read DEX/ODEX for " + btApkPath);
         }
     }
 
     private static void probeFrameworkBtAndServicesDex() {
-        DiagLogger.log("BT_PROBE", "[5/7] Passive /system/framework/services.jar (.odex) BluetoothManagerService read:");
+        DiagLogger.log("BT_PROBE", "[6/8] Passive /system/framework/services.jar (.odex) BluetoothManagerService bytecode X-ray:");
 
         File servicesJar = new File("/system/framework/services.jar");
         byte[] servicesDex = loadDexOrOdexBytes(servicesJar);
         if (servicesDex != null) {
-            logTargetedDexInventory("services.jar", servicesDex,
-                    new String[]{"bluetoothmanagerservice"},
-                    new String[]{"bluetoothmanagerservice"},
-                    true);
-            logMatchingDexStrings("services.jar", servicesDex,
-                    new String[]{"gattservice", "enablegatt", "enableradio", "ibluetoothgatt", "tcc.solution", "mbox"});
+            List<DexMethodTrace> traces = extractDexMethodTraces(
+                    servicesDex,
+                    new String[]{"com.android.server.bluetoothmanagerservice"},
+                    new String[]{
+                            "<clinit>", "<init>", "enablegatt", "getbluetoothgatt",
+                            "bluetoothstatechangehandler", "handleenable", "dobind",
+                            "sendgattservicestatuscallback", "handlemessage",
+                            "onserviceconnected", "onservicedisconnected"
+                    },
+                    null);
+            logMethodTraces("services.odex", traces);
         } else {
             DiagLogger.log("BT_DEX", "  Could not read /system/framework/services.jar (.odex) within RAM cap");
         }
     }
 
-    private static void probeNativeBtElfLibraries() {
-        DiagLogger.log("BT_PROBE", "[6/7] Passive FileInputStream ELF32 .dynsym & DT_NEEDED symbol inspection (zero dlopen):");
+    private static void logMethodTraces(String label, List<DexMethodTrace> traces) {
+        DiagLogger.log("BT_DEX", "  " + label + " targeted bytecode traces (" + traces.size() + " method(s)):");
+        for (int i = 0; i < traces.size(); i++) {
+            DexMethodTrace tr = traces.get(i);
+            DiagLogger.log("BT_DEX", "  [CODE] " + tr.className + " :: " + tr.methodSignature
+                    + " (" + tr.insnsUnits + " units, " + tr.ops.size() + " refs)");
+            StringBuilder sb = new StringBuilder();
+            for (int j = 0; j < tr.ops.size() && j < 140; j++) {
+                if (sb.length() > 0) sb.append(" -> ");
+                sb.append(tr.ops.get(j));
+                if (sb.length() >= 440) {
+                    DiagLogger.log("BT_DEX", "    ops: " + sb);
+                    sb.setLength(0);
+                }
+            }
+            if (sb.length() > 0) {
+                DiagLogger.log("BT_DEX", "    ops: " + sb);
+            }
+        }
+    }
 
-        // Primary Telechips mbox & Android JNI Bluetooth shared libraries discovered on Gen5W
+    private static void probeNativeBtElfLibraries(Set<String> mappedSoPaths) {
+        DiagLogger.log("BT_PROBE", "[7/8] Deep passive FileInputStream ELF32 .dynsym, DT_NEEDED & .rodata inspection (zero dlopen):");
+
         Set<String> targetPaths = new LinkedHashSet<String>();
-        targetPaths.add("/system/lib/libbt-client-api.so");
         targetPaths.add("/system/lib/libbluetooth_jni.so");
 
+        // Scan /system/lib/hw and /vendor/lib/hw for any Bluetooth or unknown HAL module
+        String[] hwDirs = {"/system/lib/hw", "/vendor/lib/hw"};
+        for (int d = 0; d < hwDirs.length; d++) {
+            File dir = new File(hwDirs[d]);
+            File[] files = dir.listFiles();
+            if (files == null) continue;
+            Arrays.sort(files);
+            for (int i = 0; i < files.length; i++) {
+                File f = files[i];
+                if (!f.isFile() || !f.getName().endsWith(".so")) continue;
+                String low = f.getName().toLowerCase(Locale.US);
+                if (!isUnrelatedHalModule(low)) {
+                    targetPaths.add(f.getAbsolutePath());
+                }
+            }
+        }
+
+        // Scan /system/lib and /vendor/lib for Bluetooth / mbox / Broadcom / GATT libraries
         String[] libDirs = {"/system/lib", "/vendor/lib"};
         for (int d = 0; d < libDirs.length; d++) {
             File dir = new File(libDirs[d]);
@@ -502,8 +587,18 @@ public final class BtStackProbe {
                 File f = files[i];
                 if (!f.isFile() || !f.getName().endsWith(".so")) continue;
                 String low = f.getName().toLowerCase(Locale.US);
-                if (containsAny(low, new String[]{"libbt", "bluetooth", "mbox", "gatt", "ble"})) {
+                if (containsAny(low, new String[]{"bluetooth", "brcm", "broadcom", "gatt", "ble", "mbox", "tcc_bt"})) {
                     targetPaths.add(f.getAbsolutePath());
+                }
+            }
+        }
+
+        // Include every non-boilerplate .so mapped inside com.android.bluetooth's address space
+        if (mappedSoPaths != null) {
+            for (String mp : mappedSoPaths) {
+                String name = new File(mp).getName().toLowerCase(Locale.US);
+                if (!isStandardAndroidOsLibrary(name)) {
+                    targetPaths.add(mp);
                 }
             }
         }
@@ -515,7 +610,7 @@ public final class BtStackProbe {
                 continue;
             }
             if (f.length() <= 0 || f.length() > MAX_ELF_BYTES) {
-                DiagLogger.log("BT_ELF", "  " + path + " (" + f.length() + "B) -> skipped (outside 2MB cap)");
+                DiagLogger.log("BT_ELF", "  " + path + " (" + f.length() + "B) -> skipped (outside 4MB cap)");
                 continue;
             }
 
@@ -543,21 +638,116 @@ public final class BtStackProbe {
                     + "B, machine=" + info.machine
                     + ", DT_NEEDED=" + info.neededLibs
                     + ", exported=" + info.exportedSymbols.size()
-                    + ", imported=" + info.importedSymbols.size() + ")");
+                    + ", imported=" + info.importedSymbols.size()
+                    + ", rodataStrings=" + info.rodataStrings.size() + ")");
 
-            boolean dumpAllExports = f.getName().toLowerCase(Locale.US).contains("bt-client-api")
-                    || info.exportedSymbols.size() <= 220;
-            logFilteredSymbolList("    export", info.exportedSymbols,
-                    dumpAllExports ? null : new String[]{
-                            "java_", "jni_", "register", "gatt", "ble", "le_", "_le", "scan",
-                            "adv", "tcc", "mbox", "bt_", "bta_", "btm_", "btif", "client"
-                    }, 300);
+            boolean isPrimaryBtJniOrHal = path.contains("libbluetooth_jni.so")
+                    || path.contains("/hw/")
+                    || f.getName().toLowerCase(Locale.US).contains("bluetooth")
+                    || f.getName().toLowerCase(Locale.US).contains("mbox");
 
+            // Dump ALL imported symbols when <= 160 so we see hw_get_module, open, ioctl, etc.
             logFilteredSymbolList("    import", info.importedSymbols,
-                    new String[]{
-                            "bt", "tcc", "mbox", "gatt", "ble", "le_", "bta", "btm", "hci", "ipc", "ioctl"
+                    (isPrimaryBtJniOrHal || info.importedSymbols.size() <= 160) ? null : new String[]{
+                            "hw_", "bt", "tcc", "mbox", "gatt", "ble", "le_", "bta", "btm", "hci", "ipc", "ioctl", "open", "dlopen"
                     }, 220);
+
+            logFilteredSymbolList("    export", info.exportedSymbols,
+                    (info.exportedSymbols.size() <= 200) ? null : new String[]{
+                            "hal_module_info_sym", "java_", "jni_", "register", "gatt", "ble", "le_", "_le",
+                            "scan", "adv", "tcc", "mbox", "bt_", "bta_", "btm_", "btif", "profile"
+                    }, 250);
+
+            logElfRodataStrings(f.getName(), info.rodataStrings, isPrimaryBtJniOrHal);
         }
+    }
+
+    private static void logElfRodataStrings(String fileName, List<String> rodataStrings, boolean dumpBroadly) {
+        if (rodataStrings == null || rodataStrings.isEmpty()) return;
+        String[] keywords = {
+                "bluetooth", "gatt", "mbox", "tcc", "/dev/", "hw_get", "profile",
+                "failed", "error", "init", "scan", "advertis", "ble", "brcm", "broadcom",
+                "bluedroid", "hci", "vsc", "radio", "socket", "ioctl", "client", "enable"
+        };
+        StringBuilder sb = new StringBuilder();
+        int logged = 0;
+        boolean dumpAll = dumpBroadly && rodataStrings.size() <= 380;
+        for (int i = 0; i < rodataStrings.size() && logged < 380; i++) {
+            String s = rodataStrings.get(i);
+            if (!dumpAll && !containsAny(s.toLowerCase(Locale.US), keywords)) {
+                continue;
+            }
+            if (sb.length() > 0) sb.append(" | ");
+            sb.append('"').append(redactMacOctets(s)).append('"');
+            logged++;
+            if (sb.length() >= 440) {
+                DiagLogger.log("BT_ELF", "    rodata[" + fileName + "]: " + sb);
+                sb.setLength(0);
+            }
+        }
+        if (sb.length() > 0) {
+            DiagLogger.log("BT_ELF", "    rodata[" + fileName + "]: " + sb);
+        }
+    }
+
+    private static boolean isUnrelatedHalModule(String lowerName) {
+        return lowerName.startsWith("audio.primary.")
+                || lowerName.startsWith("audio.a2dp.")
+                || lowerName.startsWith("audio.usb.")
+                || lowerName.startsWith("audio.r_submix.")
+                || lowerName.startsWith("audio_policy.")
+                || lowerName.startsWith("camera.")
+                || lowerName.startsWith("rearcamera.")
+                || lowerName.startsWith("gralloc.")
+                || lowerName.startsWith("hwcomposer.")
+                || lowerName.startsWith("lights.")
+                || lowerName.startsWith("gps.")
+                || lowerName.startsWith("nfc.")
+                || lowerName.startsWith("power.")
+                || lowerName.startsWith("sensors.")
+                || lowerName.startsWith("keystore.")
+                || lowerName.startsWith("local_time.");
+    }
+
+    private static boolean isStandardAndroidOsLibrary(String lowerName) {
+        String[] stdExact = {
+                "libc.so", "libm.so", "libdl.so", "libstdc++.so", "liblog.so",
+                "libcutils.so", "libutils.so", "libbinder.so", "libdvm.so",
+                "libjavacore.so", "libnativehelper.so", "libandroid_runtime.so",
+                "libandroid.so", "libandroidfw.so", "libhardware.so", "libhardware_legacy.so",
+                "libicui18n.so", "libicuuc.so", "libskia.so", "libgui.so", "libui.so",
+                "libegl.so", "libhwui.so", "libexpat.so", "libz.so", "libcrypto.so",
+                "libssl.so", "libsqlite.so", "libnetutils.so", "libselinux.so",
+                "libstlport.so", "libsonivox.so", "libmedia.so", "libmedia_jni.so",
+                "libvorbisidec.so", "libinput.so", "libjpeg.so", "libpng.so",
+                "libft2.so", "libbcc.so", "libbcinfo.so", "libllvm.so",
+                "libwpa_client.so", "libnetd_client.so", "libmemtrack.so",
+                "libpowermanager.so", "libsync.so", "libaudioutils.so",
+                "libcommon_time_client.so", "libnbaudio.so", "libspeexresampler.so",
+                "libeffects.so", "librs_jni.so", "libjavacrypto.so", "libportable.so",
+                "libvariablespeed.so", "libleafiaaac.so", "libbt-codec_aac_dec.so",
+                "libbt-client-api.so", "libbtsound.so", "libtinyalsa.so",
+                "libopensles.so", "libETC1.so", "libetc1.so", "libpixelflinger.so",
+                "libcorkscrew.so", "libgccdemangle.so", "libusbhost.so",
+                "libhmgapi_hook.so"
+        };
+        for (int i = 0; i < stdExact.length; i++) {
+            if (stdExact[i].equals(lowerName)) return true;
+        }
+        return lowerName.startsWith("libgles")
+                || lowerName.startsWith("libharfbuzz")
+                || lowerName.startsWith("libstagefright")
+                || lowerName.startsWith("libdrm")
+                || lowerName.startsWith("libcamera")
+                || lowerName.startsWith("libwebrtc")
+                || lowerName.startsWith("librs")
+                || lowerName.startsWith("libwebview")
+                || lowerName.startsWith("libomx.")
+                || lowerName.startsWith("libtcc.")
+                || lowerName.startsWith("libtcc_cdk")
+                || lowerName.startsWith("libtcc_omx")
+                || lowerName.startsWith("gralloc.")
+                || lowerName.startsWith("memtrack.");
     }
 
     private static void logFilteredSymbolList(String prefix, List<String> symbols,
@@ -596,54 +786,54 @@ public final class BtStackProbe {
     }
 
     private static void probeSystemFilesAndDaemons() {
-        DiagLogger.log("BT_PROBE", "[7/7] Read-only /system/etc/bluetooth, /dev nodes, USB sysfs, props & processes:");
+        DiagLogger.log("BT_PROBE", "[8/8] Unfiltered HAL directories, /dev nodes, USB sysfs, props & processes:");
 
-        File etcBt = new File("/system/etc/bluetooth");
-        File[] etcFiles = etcBt.listFiles();
-        if (etcFiles != null) {
-            Arrays.sort(etcFiles);
-            for (int i = 0; i < etcFiles.length; i++) {
-                File f = etcFiles[i];
-                DiagLogger.log("BT_SYS", "  /system/etc/bluetooth/" + f.getName()
-                        + " (" + f.length() + "B, canRead=" + f.canRead() + ")");
-                if (f.isFile() && f.canRead() && f.length() > 0 && f.length() <= 4096
-                        && (f.getName().endsWith(".conf") || f.getName().endsWith(".cfg"))) {
-                    logSmallConfigFile(f);
-                }
-            }
-        }
-
-        File permDir = new File("/system/etc/permissions");
-        File[] permFiles = permDir.listFiles();
-        if (permFiles != null) {
-            Arrays.sort(permFiles);
-            for (int i = 0; i < permFiles.length; i++) {
-                File f = permFiles[i];
-                String low = f.getName().toLowerCase(Locale.US);
-                if (containsAny(low, new String[]{"bluetooth", "broadcom", "brcm", "usb"})) {
-                    DiagLogger.log("BT_SYS", "  Permission XML: " + f.getAbsolutePath() + " (" + f.length() + "B)");
-                    if (f.isFile() && f.canRead() && f.length() <= 4096) {
-                        logSmallConfigFile(f);
-                    }
-                }
-            }
-        }
+        // Unfiltered HAL directory listings so no weirdly named HAL .so can hide
+        listAllFiles("/system/lib/hw");
+        listAllFiles("/vendor/lib/hw");
+        listAllFiles("/vendor/lib");
 
         listMatchingFiles("/system/bin", new String[]{"bt", "blue", "brcm", "broadcom", "bsa", "gatt", "mbox", "tcc"});
-        listMatchingFiles("/system/lib", new String[]{"bluetooth", "libbt", "brcm", "broadcom", "gatt", "mbox", "tcc"});
-        listMatchingFiles("/system/lib/hw", new String[]{"bluetooth", "bt", "brcm", "broadcom", "mbox", "tcc"});
+        listMatchingFiles("/system/xbin", new String[]{"bt", "blue", "brcm", "broadcom", "bsa", "gatt", "mbox", "tcc", "hciconfig", "hcitool"});
 
-        // Passive /dev directory entry listing ONLY (never opens any /dev character/block node!)
-        listMatchingDevNodes(new String[]{"bt", "mbox", "tcc", "hci", "tty", "hidraw", "usb", "rfcomm", "uinput"});
-
-        // Passive /sys/bus/usb/devices enumeration (tiny sysfs attribute text reads only)
+        listMatchingDevNodes(new String[]{"bt", "mbox", "tcc", "hci", "tty", "hidraw", "usb", "rfcomm", "uhid", "uinput"});
         probeSysfsUsbDevices();
 
         runFilteredCommand(new String[]{"/system/bin/getprop"}, "BT_PROP",
-                new String[]{".bt", "bt.", "bluetooth", "brcm", "broadcom", "gatt", "ble.", "mbox", "tcc.solution"}, true);
+                new String[]{".bt", "bt.", "bluetooth", "brcm", "broadcom", "gatt", "ble.", "mbox", "tcc.solution", "ro.hardware", "ro.board"}, true);
 
         runFilteredCommand(new String[]{"/system/bin/ps"}, "BT_PROC",
                 new String[]{"bluetooth", "btsettings", "btaudio", "brcm", "broadcom", "gatt", "dipo", "mbox", "tcc"}, false);
+    }
+
+    private static void listAllFiles(String dirPath) {
+        File d = new File(dirPath);
+        if (!d.exists()) {
+            DiagLogger.log("BT_SYS", "  " + dirPath + " -> does not exist");
+            return;
+        }
+        File[] list = d.listFiles();
+        if (list == null) {
+            DiagLogger.log("BT_SYS", "  " + dirPath + " -> listFiles() returned null (unreadable dir)");
+            return;
+        }
+        Arrays.sort(list);
+        StringBuilder sb = new StringBuilder();
+        for (int i = 0; i < list.length; i++) {
+            File f = list[i];
+            if (sb.length() > 0) sb.append(", ");
+            sb.append(f.getName())
+                    .append(f.isDirectory() ? "/" : ("(" + f.length() + "B)"));
+            if (sb.length() >= 460) {
+                DiagLogger.log("BT_SYS", "  " + dirPath + " all: " + sb);
+                sb.setLength(0);
+            }
+        }
+        if (sb.length() > 0) {
+            DiagLogger.log("BT_SYS", "  " + dirPath + " all (" + list.length + " total): " + sb);
+        } else {
+            DiagLogger.log("BT_SYS", "  " + dirPath + " all (0 files)");
+        }
     }
 
     private static void listMatchingDevNodes(String[] keywords) {
@@ -687,7 +877,7 @@ public final class BtStackProbe {
         for (int i = 0; i < entries.length; i++) {
             File dev = entries[i];
             String name = dev.getName();
-            if (name.indexOf(':') >= 0) continue; // skip interface sub-nodes; log root hubs & attached devices
+            if (name.indexOf(':') >= 0) continue;
             String vid = readTinyTextFile(new File(dev, "idVendor"));
             String pid = readTinyTextFile(new File(dev, "idProduct"));
             if (vid == null && pid == null) continue;
@@ -739,26 +929,20 @@ public final class BtStackProbe {
             }
         }
 
-        // Check sibling .odex and arm/.odex
-        String baseName = jarOrApk.getName();
-        int dot = baseName.lastIndexOf('.');
-        String stem = (dot > 0) ? baseName.substring(0, dot) : baseName;
-        File parent = jarOrApk.getParentFile();
-        File[] odexCandidates = {
-            new File(parent, stem + ".odex"),
-            new File(new File(parent, "arm"), stem + ".odex")
-        };
-        for (int i = 0; i < odexCandidates.length; i++) {
-            File odex = odexCandidates[i];
-            if (odex.isFile() && odex.canRead() && odex.length() > 0 && odex.length() <= MAX_DEX_BYTES) {
+        String path = jarOrApk.getAbsolutePath();
+        int dot = path.lastIndexOf('.');
+        if (dot > 0) {
+            File odexFile = new File(path.substring(0, dot) + ".odex");
+            if (odexFile.isFile() && odexFile.canRead()
+                    && odexFile.length() > 0 && odexFile.length() <= MAX_DEX_BYTES) {
+                DiagLogger.log("BT_DEX", "  Reading companion ODEX: " + odexFile.getAbsolutePath()
+                        + " (" + odexFile.length() + "B)");
                 FileInputStream fis = null;
                 try {
-                    fis = new FileInputStream(odex);
-                    DiagLogger.log("BT_DEX", "  Reading companion ODEX: " + odex.getAbsolutePath()
-                            + " (" + odex.length() + "B)");
+                    fis = new FileInputStream(odexFile);
                     return readStreamBounded(fis, MAX_DEX_BYTES);
                 } catch (Throwable t) {
-                    DiagLogger.log("BT_DEX", "  Failed reading " + odex.getAbsolutePath() + ": " + t);
+                    DiagLogger.log("BT_DEX", "  Failed reading " + odexFile.getAbsolutePath() + ": " + t.getMessage());
                 } finally {
                     if (fis != null) {
                         try { fis.close(); } catch (Throwable ignored) {}
@@ -767,110 +951,6 @@ public final class BtStackProbe {
             }
         }
         return null;
-    }
-
-    private static void logTargetedDexInventory(String sourceName, byte[] rawBytes,
-                                                String[] parseFilterLower,
-                                                String[] detailKeywordsLower,
-                                                boolean listMatchedClassSummary) {
-        List<DexClassEntry> classes = extractDexInventory(rawBytes, parseFilterLower);
-        DiagLogger.log("BT_DEX", "Parsed " + sourceName + " (" + rawBytes.length + "B) -> "
-                + classes.size() + (parseFilterLower != null ? " filtered" : "") + " class(es)");
-        if (classes.isEmpty()) return;
-
-        if (listMatchedClassSummary) {
-            StringBuilder classSummary = new StringBuilder();
-            for (int i = 0; i < classes.size(); i++) {
-                if (classSummary.length() > 0) classSummary.append(", ");
-                classSummary.append(classes.get(i).className);
-                if (classSummary.length() >= 480) {
-                    DiagLogger.log("BT_DEX", "  Classes: " + classSummary);
-                    classSummary.setLength(0);
-                }
-            }
-            if (classSummary.length() > 0) {
-                DiagLogger.log("BT_DEX", "  Classes: " + classSummary);
-            }
-        }
-
-        for (int i = 0; i < classes.size(); i++) {
-            DexClassEntry ce = classes.get(i);
-            String low = ce.className.toLowerCase(Locale.US);
-            if (detailKeywordsLower != null && !containsAny(low, detailKeywordsLower)) {
-                continue;
-            }
-            DiagLogger.log("BT_DEX", "  [CLASS] " + formatClassModifiers(ce.accessFlags) + ce.className
-                    + (ce.superName != null && !"java.lang.Object".equals(ce.superName)
-                    ? (" extends " + ce.superName) : ""));
-            for (int f = 0; f < ce.staticFields.size(); f++) {
-                DiagLogger.log("BT_DEX", "    sfield: " + ce.staticFields.get(f));
-            }
-            for (int f = 0; f < ce.instanceFields.size(); f++) {
-                DiagLogger.log("BT_DEX", "    ifield: " + ce.instanceFields.get(f));
-            }
-            for (int m = 0; m < ce.declaredMethods.size(); m++) {
-                DiagLogger.log("BT_DEX", "    method: " + ce.declaredMethods.get(m));
-            }
-        }
-    }
-
-    private static void logMatchingDexStrings(String sourceName, byte[] rawBytes, String[] needlesLower) {
-        byte[] dex = unwrapOdexIfNeeded(rawBytes);
-        if (dex == null) return;
-        ByteBuffer buf = ByteBuffer.wrap(dex).order(ByteOrder.LITTLE_ENDIAN);
-        if (buf.getInt(40) != 0x12345678) return;
-
-        int stringIdsSize = buf.getInt(56);
-        int stringIdsOff = buf.getInt(60);
-        if (stringIdsSize <= 0 || stringIdsOff <= 0 || stringIdsOff + stringIdsSize * 4 > dex.length) {
-            return;
-        }
-
-        StringBuilder sb = new StringBuilder();
-        int matched = 0;
-        for (int i = 0; i < stringIdsSize && matched < 45; i++) {
-            String s = readDexString(dex, buf, stringIdsSize, stringIdsOff, i);
-            if (s == null || s.length() < 4 || s.length() > 110) continue;
-            // Skip raw descriptor signatures starting with '(' or '['
-            char c0 = s.charAt(0);
-            if (c0 == '(' || c0 == '[') continue;
-            String low = s.toLowerCase(Locale.US);
-            if (containsAny(low, needlesLower)) {
-                if (sb.length() > 0) sb.append(" | ");
-                sb.append('"').append(s.replace('\n', ' ')).append('"');
-                matched++;
-                if (sb.length() >= 440) {
-                    DiagLogger.log("BT_DEX", "  " + sourceName + " strings: " + sb);
-                    sb.setLength(0);
-                }
-            }
-        }
-        if (sb.length() > 0) {
-            DiagLogger.log("BT_DEX", "  " + sourceName + " strings: " + sb);
-        }
-    }
-
-    private static void logSmallConfigFile(File f) {
-        BufferedReader br = null;
-        try {
-            br = new BufferedReader(new InputStreamReader(new FileInputStream(f), UTF8));
-            String line;
-            int lineCount = 0;
-            while ((line = br.readLine()) != null && lineCount < 60) {
-                String trimmed = line.trim();
-                if (trimmed.isEmpty() || trimmed.startsWith("#") || trimmed.startsWith("//")
-                        || trimmed.startsWith("<!--")) {
-                    continue;
-                }
-                DiagLogger.log("BT_CONF", "    " + f.getName() + ": " + redactMacOctets(trimmed));
-                lineCount++;
-            }
-        } catch (Throwable ignored) {
-        } finally {
-            if (br != null) {
-                try { br.close(); } catch (Throwable ignored) {}
-            }
-        }
     }
 
     private static void listMatchingFiles(String dirPath, String[] keywords) {
@@ -942,7 +1022,7 @@ public final class BtStackProbe {
         return masked;
     }
 
-    // ================= PURE-JAVA IN-RAM DALVIK DEX / ODEX PARSER =================
+    // ================= PURE-JAVA IN-RAM DALVIK DEX / ODEX PARSER & BYTECODE DISASSEMBLER =================
 
     public static List<DexClassEntry> extractDexInventory(byte[] rawBytes) {
         return extractDexInventory(rawBytes, null);
@@ -950,8 +1030,7 @@ public final class BtStackProbe {
 
     /**
      * Parses a Dalvik DEX ("dex\n035\0") or optimized ODEX ("dey\n036\0") byte buffer in RAM
-     * and returns defined classes (optionally pre-filtered by lowercase substring match so large
-     * system archives like services.odex allocate zero objects for unrelated classes).
+     * and returns defined classes (optionally pre-filtered by lowercase substring match).
      */
     public static List<DexClassEntry> extractDexInventory(byte[] rawBytes, String[] classFilterLower) {
         byte[] dex = unwrapOdexIfNeeded(rawBytes);
@@ -1037,7 +1116,7 @@ public final class BtStackProbe {
                     readUleb128(dex, pos); // code_off
                     String sig = formatMethodSig(dex, buf, stringIdsSize, stringIdsOff,
                             typeIdsSize, typeIdsOff, protoIdsSize, protoIdsOff,
-                            methodIdsSize, methodIdsOff, methodIdx, mAccess);
+                            methodIdsSize, methodIdsOff, methodIdx, mAccess, false);
                     if (sig != null) {
                         methods.add(sig);
                     }
@@ -1050,7 +1129,7 @@ public final class BtStackProbe {
                     readUleb128(dex, pos); // code_off
                     String sig = formatMethodSig(dex, buf, stringIdsSize, stringIdsOff,
                             typeIdsSize, typeIdsOff, protoIdsSize, protoIdsOff,
-                            methodIdsSize, methodIdsOff, methodIdx, mAccess);
+                            methodIdsSize, methodIdsOff, methodIdx, mAccess, false);
                     if (sig != null) {
                         methods.add(sig);
                     }
@@ -1067,6 +1146,303 @@ public final class BtStackProbe {
             }
         });
         return out;
+    }
+
+    /**
+     * Disassembles Dalvik/ODEX code_item instructions in RAM for matching classes and method names,
+     * extracting chronological string literals, class/resource constants, field accesses, and method calls.
+     */
+    public static List<DexMethodTrace> extractDexMethodTraces(byte[] rawBytes,
+                                                              String[] classFilterLower,
+                                                              String[] methodNamesLower,
+                                                              Map<Integer, String> resIdMap) {
+        byte[] dex = unwrapOdexIfNeeded(rawBytes);
+        if (dex == null) return Collections.emptyList();
+
+        ByteBuffer buf = ByteBuffer.wrap(dex).order(ByteOrder.LITTLE_ENDIAN);
+        if (buf.getInt(40) != 0x12345678) return Collections.emptyList();
+
+        int stringIdsSize = buf.getInt(56);
+        int stringIdsOff  = buf.getInt(60);
+        int typeIdsSize   = buf.getInt(64);
+        int typeIdsOff    = buf.getInt(68);
+        int protoIdsSize  = buf.getInt(72);
+        int protoIdsOff   = buf.getInt(76);
+        int fieldIdsSize  = buf.getInt(80);
+        int fieldIdsOff   = buf.getInt(84);
+        int methodIdsSize = buf.getInt(88);
+        int methodIdsOff  = buf.getInt(92);
+        int classDefsSize = buf.getInt(96);
+        int classDefsOff  = buf.getInt(100);
+
+        if (classDefsSize <= 0 || classDefsOff <= 0 || classDefsOff + classDefsSize * 32 > dex.length) {
+            return Collections.emptyList();
+        }
+
+        List<DexMethodTrace> traces = new ArrayList<DexMethodTrace>();
+        for (int c = 0; c < classDefsSize; c++) {
+            int cOff = classDefsOff + c * 32;
+            int classIdx = buf.getInt(cOff);
+            String className = readTypeName(dex, buf, stringIdsSize, stringIdsOff, typeIdsSize, typeIdsOff, classIdx);
+            String classLow = className.toLowerCase(Locale.US);
+            if (classFilterLower != null && !containsAny(classLow, classFilterLower)) {
+                continue;
+            }
+
+            int classDataOff = buf.getInt(cOff + 24);
+            if (classDataOff <= 0 || classDataOff >= dex.length) continue;
+
+            int[] pos = new int[]{classDataOff};
+            int staticFieldsSize = readUleb128(dex, pos);
+            int instanceFieldsSize = readUleb128(dex, pos);
+            int directMethodsSize = readUleb128(dex, pos);
+            int virtualMethodsSize = readUleb128(dex, pos);
+
+            for (int i = 0; i < staticFieldsSize && pos[0] < dex.length; i++) {
+                readUleb128(dex, pos);
+                readUleb128(dex, pos);
+            }
+            for (int i = 0; i < instanceFieldsSize && pos[0] < dex.length; i++) {
+                readUleb128(dex, pos);
+                readUleb128(dex, pos);
+            }
+
+            for (int pass = 0; pass < 2; pass++) {
+                int count = (pass == 0) ? directMethodsSize : virtualMethodsSize;
+                int methodIdx = 0;
+                for (int i = 0; i < count && pos[0] < dex.length; i++) {
+                    methodIdx += readUleb128(dex, pos);
+                    int mAccess = readUleb128(dex, pos);
+                    int codeOff = readUleb128(dex, pos);
+                    if (codeOff <= 0 || codeOff + 16 > dex.length) continue;
+
+                    String mName = readMethodSimpleName(dex, buf, stringIdsSize, stringIdsOff,
+                            methodIdsSize, methodIdsOff, methodIdx);
+                    if (mName == null) continue;
+                    if (methodNamesLower != null && !equalsAny(mName.toLowerCase(Locale.US), methodNamesLower)) {
+                        continue;
+                    }
+
+                    String sig = formatMethodSig(dex, buf, stringIdsSize, stringIdsOff,
+                            typeIdsSize, typeIdsOff, protoIdsSize, protoIdsOff,
+                            methodIdsSize, methodIdsOff, methodIdx, mAccess, true);
+                    if (sig == null) sig = mName;
+
+                    int insnsUnits = buf.getInt(codeOff + 12);
+                    int insnsOff = codeOff + 16;
+                    if (insnsUnits <= 0 || insnsUnits > 32768 || insnsOff + insnsUnits * 2 > dex.length) {
+                        continue;
+                    }
+
+                    List<String> ops = decodeCodeItemRefs(dex, buf, insnsOff, insnsUnits,
+                            stringIdsSize, stringIdsOff, typeIdsSize, typeIdsOff,
+                            fieldIdsSize, fieldIdsOff, methodIdsSize, methodIdsOff, resIdMap);
+                    traces.add(new DexMethodTrace(className, sig, insnsUnits, ops));
+                }
+            }
+        }
+        return traces;
+    }
+
+    private static List<String> decodeCodeItemRefs(byte[] dex, ByteBuffer buf,
+                                                   int insnsOff, int insnsUnits,
+                                                   int stringIdsSize, int stringIdsOff,
+                                                   int typeIdsSize, int typeIdsOff,
+                                                   int fieldIdsSize, int fieldIdsOff,
+                                                   int methodIdsSize, int methodIdsOff,
+                                                   Map<Integer, String> resIdMap) {
+        List<String> ops = new ArrayList<String>();
+        int pc = 0;
+        while (pc < insnsUnits) {
+            int bOff = insnsOff + pc * 2;
+            int word0 = buf.getShort(bOff) & 0xFFFF;
+            int opcode = word0 & 0xFF;
+
+            // Payload pseudo-instructions aligned at end of method
+            if (word0 == 0x0100 && pc + 2 <= insnsUnits) { // packed-switch-payload
+                int sz = buf.getShort(bOff + 2) & 0xFFFF;
+                pc += 4 + sz * 2;
+                continue;
+            } else if (word0 == 0x0200 && pc + 2 <= insnsUnits) { // sparse-switch-payload
+                int sz = buf.getShort(bOff + 2) & 0xFFFF;
+                pc += 2 + sz * 4;
+                continue;
+            } else if (word0 == 0x0300 && pc + 4 <= insnsUnits) { // fill-array-data-payload
+                int elemW = buf.getShort(bOff + 2) & 0xFFFF;
+                int sz = buf.getInt(bOff + 4);
+                if (elemW == 4 && sz > 0 && sz <= 32 && bOff + 8 + sz * 4 <= dex.length) {
+                    StringBuilder arrSb = new StringBuilder("int[]{");
+                    for (int k = 0; k < sz; k++) {
+                        if (k > 0) arrSb.append(',');
+                        int v = buf.getInt(bOff + 8 + k * 4);
+                        arrSb.append(formatConstInt(v, resIdMap));
+                    }
+                    arrSb.append('}');
+                    ops.add(arrSb.toString());
+                }
+                pc += 4 + (sz * elemW + 1) / 2;
+                continue;
+            }
+
+            int width = dalvikOpcodeWidth(opcode);
+            if (pc + width > insnsUnits) break;
+
+            switch (opcode) {
+                case 0x14: { // const vAA, #+BBBBBBBB
+                    int lit = buf.getInt(bOff + 2);
+                    if ((lit & 0xFF000000) == 0x7F000000 || (lit >= 100 && lit <= 10000)) {
+                        ops.add("const " + formatConstInt(lit, resIdMap));
+                    }
+                    break;
+                }
+                case 0x1a: { // const-string
+                    int sIdx = buf.getShort(bOff + 2) & 0xFFFF;
+                    String s = readDexString(dex, buf, stringIdsSize, stringIdsOff, sIdx);
+                    ops.add("\"" + s.replace('\n', ' ') + "\"");
+                    break;
+                }
+                case 0x1b: { // const-string/jumbo
+                    int sIdx = buf.getInt(bOff + 2);
+                    String s = readDexString(dex, buf, stringIdsSize, stringIdsOff, sIdx);
+                    ops.add("\"" + s.replace('\n', ' ') + "\"");
+                    break;
+                }
+                case 0x1c: { // const-class
+                    int tIdx = buf.getShort(bOff + 2) & 0xFFFF;
+                    ops.add("class:" + shortClassName(readTypeName(dex, buf, stringIdsSize, stringIdsOff, typeIdsSize, typeIdsOff, tIdx)));
+                    break;
+                }
+                case 0x22: { // new-instance
+                    int tIdx = buf.getShort(bOff + 2) & 0xFFFF;
+                    ops.add("new:" + shortClassName(readTypeName(dex, buf, stringIdsSize, stringIdsOff, typeIdsSize, typeIdsOff, tIdx)));
+                    break;
+                }
+                case 0x52: case 0x53: case 0x54: case 0x55: case 0x56: case 0x57: case 0x58:
+                case 0x60: case 0x61: case 0x62: case 0x63: case 0x64: case 0x65: case 0x66:
+                case 0xe3: case 0xe5: case 0xe7: case 0xe8: case 0xea: case 0xfd: { // *get*
+                    int fIdx = buf.getShort(bOff + 2) & 0xFFFF;
+                    ops.add("get:" + formatShortFieldRef(dex, buf, stringIdsSize, stringIdsOff,
+                            typeIdsSize, typeIdsOff, fieldIdsSize, fieldIdsOff, fIdx));
+                    break;
+                }
+                case 0x59: case 0x5a: case 0x5b: case 0x5c: case 0x5d: case 0x5e: case 0x5f:
+                case 0x67: case 0x68: case 0x69: case 0x6a: case 0x6b: case 0x6c: case 0x6d:
+                case 0xe4: case 0xe6: case 0xe9: case 0xeb: case 0xfc: case 0xfe: { // *put*
+                    int fIdx = buf.getShort(bOff + 2) & 0xFFFF;
+                    ops.add("put:" + formatShortFieldRef(dex, buf, stringIdsSize, stringIdsOff,
+                            typeIdsSize, typeIdsOff, fieldIdsSize, fieldIdsOff, fIdx));
+                    break;
+                }
+                case 0x6e: case 0x6f: case 0x70: case 0x71: case 0x72:
+                case 0x74: case 0x75: case 0x76: case 0x77: case 0x78:
+                case 0xf0: { // invoke-*
+                    int mIdx = buf.getShort(bOff + 2) & 0xFFFF;
+                    ops.add("call:" + formatShortMethodRef(dex, buf, stringIdsSize, stringIdsOff,
+                            typeIdsSize, typeIdsOff, fieldIdsOff, methodIdsSize, methodIdsOff, mIdx));
+                    break;
+                }
+                case 0xf8: case 0xf9: case 0xfa: case 0xfb: { // invoke-virtual/super-quick (ODEX)
+                    int vtIdx = buf.getShort(bOff + 2) & 0xFFFF;
+                    ops.add("qcall:vt#" + vtIdx);
+                    break;
+                }
+                default:
+                    break;
+            }
+            pc += width;
+        }
+        return ops;
+    }
+
+    private static String formatConstInt(int v, Map<Integer, String> resIdMap) {
+        if (resIdMap != null) {
+            String r = resIdMap.get(Integer.valueOf(v));
+            if (r != null) {
+                return String.format(Locale.US, "0x%08x[%s]", Integer.valueOf(v), r);
+            }
+        }
+        if ((v & 0xFF000000) == 0x7F000000) {
+            return String.format(Locale.US, "0x%08x", Integer.valueOf(v));
+        }
+        return String.valueOf(v);
+    }
+
+    /**
+     * Exact AOSP 4.4 KitKat libdex instruction width (in 16-bit code units) for all 256 opcodes 0x00..0xFF,
+     * including ODEX quickened / volatile opcodes 0xE3..0xFF.
+     */
+    private static int dalvikOpcodeWidth(int op) {
+        switch (op) {
+            case 0x00: case 0x01: case 0x04: case 0x07:
+            case 0x0a: case 0x0b: case 0x0c: case 0x0d:
+            case 0x0e: case 0x0f: case 0x10: case 0x11: case 0x12:
+            case 0x1d: case 0x1e: case 0x21: case 0x27: case 0x28:
+            case 0xec: case 0xf1:
+                return 1;
+            case 0x18: // const-wide (51l)
+                return 5;
+            case 0x03: case 0x06: case 0x09:
+            case 0x14: case 0x17: case 0x1b:
+            case 0x24: case 0x25: case 0x26:
+            case 0x2a: case 0x2b: case 0x2c:
+            case 0x6e: case 0x6f: case 0x70: case 0x71: case 0x72:
+            case 0x74: case 0x75: case 0x76: case 0x77: case 0x78:
+            case 0xee: case 0xef: case 0xf0:
+            case 0xf8: case 0xf9: case 0xfa: case 0xfb:
+                return 3;
+            default:
+                if (op >= 0x7b && op <= 0x8f) return 1; // unop 12x
+                if (op >= 0xb0 && op <= 0xcf) return 1; // binop/2addr 12x
+                if ((op >= 0x3e && op <= 0x43) || op == 0x73 || op == 0x79 || op == 0x7a || op == 0xff) {
+                    return 1; // unused 10x
+                }
+                return 2; // all remaining 20t/21c/21h/21s/21t/22b/22c/22cs/22s/22t/22x/23x ops
+        }
+    }
+
+    private static String shortClassName(String fqcn) {
+        if (fqcn == null) return "?";
+        int dot = fqcn.lastIndexOf('.');
+        return dot >= 0 ? fqcn.substring(dot + 1) : fqcn;
+    }
+
+    private static String formatShortFieldRef(byte[] dex, ByteBuffer buf,
+                                              int stringIdsSize, int stringIdsOff,
+                                              int typeIdsSize, int typeIdsOff,
+                                              int fieldIdsSize, int fieldIdsOff, int fieldIdx) {
+        if (fieldIdx < 0 || fieldIdx >= fieldIdsSize) return "field#" + fieldIdx;
+        int fOff = fieldIdsOff + fieldIdx * 8;
+        if (fOff < 0 || fOff + 8 > dex.length) return "field#" + fieldIdx;
+        int ownerIdx = buf.getShort(fOff) & 0xFFFF;
+        int nameIdx = buf.getInt(fOff + 4);
+        String owner = shortClassName(readTypeName(dex, buf, stringIdsSize, stringIdsOff, typeIdsSize, typeIdsOff, ownerIdx));
+        String name = readDexString(dex, buf, stringIdsSize, stringIdsOff, nameIdx);
+        return owner + "." + name;
+    }
+
+    private static String formatShortMethodRef(byte[] dex, ByteBuffer buf,
+                                               int stringIdsSize, int stringIdsOff,
+                                               int typeIdsSize, int typeIdsOff,
+                                               int unused,
+                                               int methodIdsSize, int methodIdsOff, int methodIdx) {
+        if (methodIdx < 0 || methodIdx >= methodIdsSize) return "method#" + methodIdx;
+        int mOff = methodIdsOff + methodIdx * 8;
+        if (mOff < 0 || mOff + 8 > dex.length) return "method#" + methodIdx;
+        int ownerIdx = buf.getShort(mOff) & 0xFFFF;
+        int nameIdx = buf.getInt(mOff + 4);
+        String owner = shortClassName(readTypeName(dex, buf, stringIdsSize, stringIdsOff, typeIdsSize, typeIdsOff, ownerIdx));
+        String name = readDexString(dex, buf, stringIdsSize, stringIdsOff, nameIdx);
+        return owner + "." + name + "()";
+    }
+
+    private static String readMethodSimpleName(byte[] dex, ByteBuffer buf,
+                                               int stringIdsSize, int stringIdsOff,
+                                               int methodIdsSize, int methodIdsOff, int methodIdx) {
+        if (methodIdx < 0 || methodIdx >= methodIdsSize) return null;
+        int mOff = methodIdsOff + methodIdx * 8;
+        if (mOff < 0 || mOff + 8 > dex.length) return null;
+        int nameIdx = buf.getInt(mOff + 4);
+        return readDexString(dex, buf, stringIdsSize, stringIdsOff, nameIdx);
     }
 
     private static byte[] unwrapOdexIfNeeded(byte[] rawBytes) {
@@ -1153,14 +1529,15 @@ public final class BtStackProbe {
                                           int typeIdsSize, int typeIdsOff,
                                           int protoIdsSize, int protoIdsOff,
                                           int methodIdsSize, int methodIdsOff,
-                                          int methodIdx, int accessFlags) {
+                                          int methodIdx, int accessFlags,
+                                          boolean includeClinit) {
         if (methodIdx < 0 || methodIdx >= methodIdsSize) return null;
         int mOff = methodIdsOff + methodIdx * 8;
         if (mOff < 0 || mOff + 8 > dex.length) return null;
         int protoIdx = buf.getShort(mOff + 2) & 0xFFFF;
         int nameIdx = buf.getInt(mOff + 4);
         String name = readDexString(dex, buf, stringIdsSize, stringIdsOff, nameIdx);
-        if ("<clinit>".equals(name)) return null;
+        if (!includeClinit && "<clinit>".equals(name)) return null;
 
         if (protoIdx < 0 || protoIdx >= protoIdsSize) {
             return formatMemberModifiers(accessFlags) + name + "(?)";
@@ -1224,16 +1601,6 @@ public final class BtStackProbe {
         return sb.toString();
     }
 
-    private static String formatClassModifiers(int flags) {
-        StringBuilder sb = new StringBuilder();
-        if ((flags & 0x0001) != 0) sb.append("public ");
-        if ((flags & 0x0200) != 0) sb.append("interface ");
-        else if ((flags & 0x4000) != 0) sb.append("enum ");
-        else if ((flags & 0x0400) != 0) sb.append("abstract class ");
-        else sb.append("class ");
-        return sb.toString();
-    }
-
     private static String formatMemberModifiers(int flags) {
         StringBuilder sb = new StringBuilder();
         if ((flags & 0x0001) != 0) sb.append("public ");
@@ -1244,7 +1611,7 @@ public final class BtStackProbe {
         return sb.toString();
     }
 
-    // ================= PURE-JAVA IN-RAM ELF32 .DYNSYM & .DYNAMIC PARSER =================
+    // ================= PURE-JAVA IN-RAM ELF32 .DYNSYM, .DYNAMIC & .RODATA PARSER =================
 
     /**
      * Convenience wrapper returning sorted defined dynamic symbol names from a 32-bit LSB ELF buffer.
@@ -1256,8 +1623,8 @@ public final class BtStackProbe {
 
     /**
      * Parses a 32-bit little-endian ELF shared object (.so) buffer purely in RAM (zero dlopen)
-     * and extracts DT_NEEDED library names plus defined (exported) and undefined (imported)
-     * dynamic C symbols from SHT_DYNSYM / SHT_STRTAB.
+     * and extracts DT_NEEDED library names, exported/imported dynamic C symbols, and printable
+     * C string literals from non-executable allocated SHT_PROGBITS (.rodata) sections.
      */
     public static Elf32Info extractElf32Info(byte[] elf) {
         if (elf == null || elf.length < 52) {
@@ -1275,32 +1642,58 @@ public final class BtStackProbe {
         long shOff = buf.getInt(32) & 0xFFFFFFFFL;
         int shEntSize = buf.getShort(46) & 0xFFFF;
         int shNum = buf.getShort(48) & 0xFFFF;
+        int shStrNdx = buf.getShort(50) & 0xFFFF;
 
         if (shOff <= 0 || shEntSize < 40 || shNum <= 0
                 || shOff + (long) shEntSize * (long) shNum > elf.length) {
             return new Elf32Info(machine,
                     Collections.<String>emptyList(),
                     Collections.<String>emptyList(),
+                    Collections.<String>emptyList(),
                     Collections.<String>emptyList());
+        }
+
+        long shStrTabOff = 0;
+        long shStrTabSize = 0;
+        if (shStrNdx >= 0 && shStrNdx < shNum) {
+            int shStrPos = (int) (shOff + (long) shStrNdx * shEntSize);
+            if (buf.getInt(shStrPos + 4) == 3) {
+                shStrTabOff = buf.getInt(shStrPos + 16) & 0xFFFFFFFFL;
+                shStrTabSize = buf.getInt(shStrPos + 20) & 0xFFFFFFFFL;
+            }
         }
 
         Set<String> neededSet = new LinkedHashSet<String>();
         Set<String> exportSet = new LinkedHashSet<String>();
         Set<String> importSet = new LinkedHashSet<String>();
+        Set<String> rodataSet = new LinkedHashSet<String>();
 
         for (int s = 0; s < shNum; s++) {
             int shPos = (int) (shOff + (long) s * shEntSize);
+            long shNameOff = buf.getInt(shPos) & 0xFFFFFFFFL;
             int shType = buf.getInt(shPos + 4);
-            if (shType != 6 && shType != 11) { // 6 = SHT_DYNAMIC, 11 = SHT_DYNSYM
-                continue;
-            }
-
+            long shFlags = buf.getInt(shPos + 8) & 0xFFFFFFFFL;
             long secOff = buf.getInt(shPos + 16) & 0xFFFFFFFFL;
             long secSize = buf.getInt(shPos + 20) & 0xFFFFFFFFL;
             int shLink = buf.getInt(shPos + 24);
             int entSize = buf.getInt(shPos + 36);
 
             if (secOff <= 0 || secSize <= 0 || secOff + secSize > elf.length) {
+                continue;
+            }
+
+            // Extract printable C strings from .rodata* (or non-exec allocated PROGBITS)
+            if (shType == 1 && (shFlags & 0x2L) != 0 && (shFlags & 0x4L) == 0 && rodataSet.size() < 1200) {
+                String secName = (shStrTabOff > 0 && shStrTabSize > 0 && shStrTabOff + shStrTabSize <= elf.length)
+                        ? readElfNullTermString(elf, shStrTabOff, shStrTabSize, shNameOff)
+                        : null;
+                if (secName == null || secName.startsWith(".rodata") || ".data".equals(secName)
+                        || secName.startsWith(".data.rel.ro")) {
+                    extractPrintableNullTermStrings(elf, (int) secOff, (int) Math.min(secSize, 524288L), rodataSet, 1200);
+                }
+            }
+
+            if (shType != 6 && shType != 11) { // 6 = SHT_DYNAMIC, 11 = SHT_DYNSYM
                 continue;
             }
             if (shLink < 0 || shLink >= shNum) {
@@ -1319,8 +1712,8 @@ public final class BtStackProbe {
                 int step = (entSize >= 8) ? entSize : 8;
                 for (long p = secOff; p + 8 <= secOff + secSize; p += step) {
                     int dTag = buf.getInt((int) p);
-                    if (dTag == 0) break; // DT_NULL
-                    if (dTag == 1) {      // DT_NEEDED
+                    if (dTag == 0) break;
+                    if (dTag == 1) {
                         long nameOff = buf.getInt((int) p + 4) & 0xFFFFFFFFL;
                         String libName = readElfNullTermString(elf, strOff, strSize, nameOff);
                         if (libName != null && !libName.isEmpty()) {
@@ -1332,11 +1725,11 @@ public final class BtStackProbe {
                 int step = (entSize >= 16) ? entSize : 16;
                 long idx = 0;
                 for (long p = secOff; p + 16 <= secOff + secSize; p += step, idx++) {
-                    if (idx == 0) continue; // STN_UNDEF
+                    if (idx == 0) continue;
                     long stName = buf.getInt((int) p) & 0xFFFFFFFFL;
                     int stInfo = elf[(int) p + 12] & 0xFF;
                     int stType = stInfo & 0x0F;
-                    if (stType == 3 || stType == 4) continue; // STT_SECTION, STT_FILE
+                    if (stType == 3 || stType == 4) continue;
                     int stShndx = buf.getShort((int) p + 14) & 0xFFFF;
                     String symName = readElfNullTermString(elf, strOff, strSize, stName);
                     if (symName == null || symName.isEmpty()) continue;
@@ -1352,9 +1745,41 @@ public final class BtStackProbe {
         List<String> needed = new ArrayList<String>(neededSet);
         List<String> exported = new ArrayList<String>(exportSet);
         List<String> imported = new ArrayList<String>(importSet);
+        List<String> rodata = new ArrayList<String>(rodataSet);
         Collections.sort(exported);
         Collections.sort(imported);
-        return new Elf32Info(machine, needed, exported, imported);
+        return new Elf32Info(machine, needed, exported, imported, rodata);
+    }
+
+    private static void extractPrintableNullTermStrings(byte[] elf, int startOff, int len,
+                                                        Set<String> out, int maxCount) {
+        int endLimit = Math.min(elf.length, startOff + len);
+        int runStart = -1;
+        int alphaCount = 0;
+        for (int i = startOff; i < endLimit && out.size() < maxCount; i++) {
+            int b = elf[i] & 0xFF;
+            if ((b >= 0x20 && b <= 0x7E) || b == '\t') {
+                if (runStart < 0) {
+                    runStart = i;
+                    alphaCount = 0;
+                }
+                if ((b >= 'A' && b <= 'Z') || (b >= 'a' && b <= 'z')) {
+                    alphaCount++;
+                }
+            } else {
+                if (b == 0 && runStart >= 0) {
+                    int sLen = i - runStart;
+                    if (sLen >= 4 && sLen <= 140 && alphaCount >= 2) {
+                        String s = new String(elf, runStart, sLen, UTF8).trim();
+                        if (s.length() >= 4 && !s.startsWith("(")) {
+                            out.add(s);
+                        }
+                    }
+                }
+                runStart = -1;
+                alphaCount = 0;
+            }
+        }
     }
 
     private static String readElfNullTermString(byte[] elf, long strTabOff, long strTabSize, long relOff) {
@@ -1387,45 +1812,6 @@ public final class BtStackProbe {
         return sb.toString();
     }
 
-    private static void dumpInterfaceMethods(String label, Class<?> implCls) {
-        Class<?>[] ifaces = implCls.getInterfaces();
-        for (int i = 0; i < ifaces.length; i++) {
-            if (!"android.os.IInterface".equals(ifaces[i].getName())) {
-                dumpAllDeclaredMethods(label + "[" + ifaces[i].getName() + "]", ifaces[i]);
-            }
-        }
-    }
-
-    private static void dumpAllDeclaredMethods(String label, Class<?> cls) {
-        Method[] methods = cls.getDeclaredMethods();
-        List<String> sigs = new ArrayList<String>(methods.length);
-        for (int i = 0; i < methods.length; i++) {
-            sigs.add(formatReflectMethod(methods[i]));
-        }
-        Collections.sort(sigs);
-        DiagLogger.log("BT_PROBE", "  " + label + " methods (" + sigs.size() + "):");
-        for (int i = 0; i < sigs.size(); i++) {
-            DiagLogger.log("BT_PROBE", "    " + sigs.get(i));
-        }
-    }
-
-    private static String formatReflectMethod(Method m) {
-        StringBuilder sb = new StringBuilder();
-        int mod = m.getModifiers();
-        if (Modifier.isPublic(mod)) sb.append("public ");
-        else if (Modifier.isProtected(mod)) sb.append("protected ");
-        else if (Modifier.isPrivate(mod)) sb.append("private ");
-        if (Modifier.isStatic(mod)) sb.append("static ");
-        sb.append(m.getReturnType().getSimpleName()).append(' ').append(m.getName()).append('(');
-        Class<?>[] params = m.getParameterTypes();
-        for (int i = 0; i < params.length; i++) {
-            if (i > 0) sb.append(", ");
-            sb.append(params[i].getSimpleName());
-        }
-        sb.append(')');
-        return sb.toString();
-    }
-
     private static byte[] readStreamBounded(InputStream is, int maxBytes) throws Exception {
         ByteArrayOutputStream bos = new ByteArrayOutputStream(65536);
         byte[] buf = new byte[16384];
@@ -1444,6 +1830,13 @@ public final class BtStackProbe {
     private static boolean containsAny(String haystackLower, String[] needles) {
         for (int i = 0; i < needles.length; i++) {
             if (haystackLower.indexOf(needles[i]) >= 0) return true;
+        }
+        return false;
+    }
+
+    private static boolean equalsAny(String valueLower, String[] candidatesLower) {
+        for (int i = 0; i < candidatesLower.length; i++) {
+            if (candidatesLower[i].equals(valueLower)) return true;
         }
         return false;
     }

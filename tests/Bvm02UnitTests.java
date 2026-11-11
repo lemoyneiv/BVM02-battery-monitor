@@ -363,8 +363,32 @@ public final class Bvm02UnitTests {
         List<BtStackProbe.DexClassEntry> odexClasses = BtStackProbe.extractDexInventory(fakeOdex);
         assertEquals("odex class count matches dex class count", classes.size(), odexClasses.size());
 
+        // Verify Dalvik/ODEX code_item bytecode disassembler (extractDexMethodTraces)
+        List<BtStackProbe.DexMethodTrace> traces = BtStackProbe.extractDexMethodTraces(
+                fakeOdex,
+                new String[]{"bvm02.app.btstackprobe", "bvm02.app.hmgapidclient"},
+                new String[]{"checkibluetoothgattstatus", "runmanualserviceandreadlog"},
+                null);
+        assertTrue("extracted >= 2 targeted method bytecode traces from fakeOdex", traces.size() >= 2);
+        boolean sawGetBluetoothGattLiteral = false;
+        boolean sawPingLiteral = false;
+        for (int i = 0; i < traces.size(); i++) {
+            BtStackProbe.DexMethodTrace tr = traces.get(i);
+            assertTrue("trace has positive insnsUnits", tr.insnsUnits > 0);
+            assertTrue("trace decoded references", !tr.ops.isEmpty());
+            for (int j = 0; j < tr.ops.size(); j++) {
+                String op = tr.ops.get(j);
+                if (op.contains("getBluetoothGatt")) sawGetBluetoothGattLiteral = true;
+                if (op.contains("\"ping\"")) sawPingLiteral = true;
+            }
+        }
+        assertTrue("bytecode disassembler decoded getBluetoothGatt string ref", sawGetBluetoothGattLiteral);
+        assertTrue("bytecode disassembler decoded HmgapidClient \"ping\" string ref", sawPingLiteral);
+
         // Malformed / truncated buffers return empty list safely
         assertEquals("reject short buffer", 0, BtStackProbe.extractDexInventory(new byte[10]).size());
+        assertEquals("reject short trace buffer", 0,
+                BtStackProbe.extractDexMethodTraces(new byte[10], null, null, null).size());
     }
 
     private static void testElf32SymbolParserAndMacRedaction() {
@@ -380,12 +404,7 @@ public final class Bvm02UnitTests {
                 BtStackProbe.redactMacOctets("[ro.build.host]: [cbcd-deploy-050709073412]"));
 
         // 2. Synthesize a valid minimal 32-bit ARM (EM_ARM=40) little-endian ELF shared object
-        //    Layout:
-        //      [0..51]     Elf32_Ehdr (52B)
-        //      [64..159]   .dynstr    (SHT_STRTAB=3)
-        //      [160..191]  .dynamic   (SHT_DYNAMIC=6: DT_NEEDED x2 + DT_NULL)
-        //      [192..255]  .dynsym    (SHT_DYNSYM=11: STN_UNDEF + 2 exports + 1 import)
-        //      [256..415]  Section headers (4 x 40B = 160B)
+        //    including .shstrtab + .rodata + .dynstr + .dynamic + .dynsym
         byte[] dynstrBytes = (
                 "\0"
                 + "libc.so\0"                  // off 1
@@ -394,8 +413,15 @@ public final class Bvm02UnitTests {
                 + "tcc_bt_gatt_scan_start\0"   // off 43
                 + "ioctl\0"                    // off 66
         ).getBytes(Charset.forName("UTF-8"));
+        byte[] rodataBytes = (
+                "/dev/tcc_bt_dev\0"
+                + "Failed to get Bluetooth GATT Interface\0"
+        ).getBytes(Charset.forName("UTF-8"));
+        byte[] shstrBytes = (
+                "\0.dynstr\0.dynamic\0.dynsym\0.rodata\0.shstrtab\0"
+        ).getBytes(Charset.forName("UTF-8"));
 
-        byte[] elf = new byte[432];
+        byte[] elf = new byte[768];
         ByteBuffer b = ByteBuffer.wrap(elf).order(ByteOrder.LITTLE_ENDIAN);
         elf[0] = 0x7F;
         elf[1] = 'E';
@@ -407,13 +433,16 @@ public final class Bvm02UnitTests {
         b.putShort(16, (short) 3);   // ET_DYN
         b.putShort(18, (short) 40);  // EM_ARM
         b.putInt(20, 1);             // e_version
-        b.putInt(32, 256);           // e_shoff
+        b.putInt(32, 448);           // e_shoff
         b.putShort(40, (short) 52);  // e_ehsize
         b.putShort(46, (short) 40);  // e_shentsize
-        b.putShort(48, (short) 4);   // e_shnum
+        b.putShort(48, (short) 6);   // e_shnum
+        b.putShort(50, (short) 5);   // e_shstrndx
 
-        // Copy .dynstr at 64
+        // Copy .dynstr at 64, .dynamic at 160, .dynsym at 192, .rodata at 272, .shstrtab at 368
         System.arraycopy(dynstrBytes, 0, elf, 64, dynstrBytes.length);
+        System.arraycopy(rodataBytes, 0, elf, 272, rodataBytes.length);
+        System.arraycopy(shstrBytes, 0, elf, 368, shstrBytes.length);
 
         // .dynamic at 160 (3 entries x 8B = 24B)
         b.putInt(160, 1); b.putInt(164, 1);  // DT_NEEDED -> "libc.so"
@@ -421,50 +450,64 @@ public final class Bvm02UnitTests {
         b.putInt(176, 0); b.putInt(180, 0);  // DT_NULL
 
         // .dynsym at 192 (4 entries x 16B = 64B)
-        // Entry 1 (192 + 16 = 208): exported func "tcc_bt_client_init" (shndx=1)
         b.putInt(208, 24);
         b.putInt(212, 0x00001200);
         b.putInt(216, 48);
-        elf[220] = (byte) ((1 << 4) | 2); // STB_GLOBAL | STT_FUNC
+        elf[220] = (byte) ((1 << 4) | 2);
         b.putShort(222, (short) 1);
 
-        // Entry 2 (192 + 32 = 224): exported func "tcc_bt_gatt_scan_start" (shndx=1)
         b.putInt(224, 43);
         b.putInt(228, 0x00001400);
         b.putInt(232, 64);
-        elf[236] = (byte) ((1 << 4) | 2); // STB_GLOBAL | STT_FUNC
+        elf[236] = (byte) ((1 << 4) | 2);
         b.putShort(238, (short) 1);
 
-        // Entry 3 (192 + 48 = 240): imported func "ioctl" (shndx=0 SHN_UNDEF)
         b.putInt(240, 66);
         b.putInt(244, 0);
         b.putInt(248, 0);
         elf[252] = (byte) ((1 << 4) | 2);
         b.putShort(254, (short) 0);
 
-        // Section headers at 256 (4 x 40B):
-        // [0] SHT_NULL (all zeros)
-        // [1] .dynstr (index 1): sh_type=3 (SHT_STRTAB), sh_offset=64, sh_size=dynstrBytes.length
-        int sh1 = 256 + 40;
+        // Section headers at 448 (6 x 40B = 240B):
+        // [1] .dynstr (name off 1)
+        int sh1 = 448 + 40;
+        b.putInt(sh1, 1);
         b.putInt(sh1 + 4, 3);
         b.putInt(sh1 + 16, 64);
         b.putInt(sh1 + 20, dynstrBytes.length);
 
-        // [2] .dynamic (index 2): sh_type=6 (SHT_DYNAMIC), sh_offset=160, sh_size=24, sh_link=1, sh_entsize=8
-        int sh2 = 256 + 80;
+        // [2] .dynamic (name off 9)
+        int sh2 = 448 + 80;
+        b.putInt(sh2, 9);
         b.putInt(sh2 + 4, 6);
         b.putInt(sh2 + 16, 160);
         b.putInt(sh2 + 20, 24);
         b.putInt(sh2 + 24, 1);
         b.putInt(sh2 + 36, 8);
 
-        // [3] .dynsym (index 3): sh_type=11 (SHT_DYNSYM), sh_offset=192, sh_size=64, sh_link=1, sh_entsize=16
-        int sh3 = 256 + 120;
+        // [3] .dynsym (name off 18)
+        int sh3 = 448 + 120;
+        b.putInt(sh3, 18);
         b.putInt(sh3 + 4, 11);
         b.putInt(sh3 + 16, 192);
         b.putInt(sh3 + 20, 64);
         b.putInt(sh3 + 24, 1);
         b.putInt(sh3 + 36, 16);
+
+        // [4] .rodata (name off 26): sh_type=1 (SHT_PROGBITS), sh_flags=2 (SHF_ALLOC)
+        int sh4 = 448 + 160;
+        b.putInt(sh4, 26);
+        b.putInt(sh4 + 4, 1);
+        b.putInt(sh4 + 8, 2);
+        b.putInt(sh4 + 16, 272);
+        b.putInt(sh4 + 20, rodataBytes.length);
+
+        // [5] .shstrtab (name off 34): sh_type=3 (SHT_STRTAB)
+        int sh5 = 448 + 200;
+        b.putInt(sh5, 34);
+        b.putInt(sh5 + 4, 3);
+        b.putInt(sh5 + 16, 368);
+        b.putInt(sh5 + 20, shstrBytes.length);
 
         BtStackProbe.Elf32Info info = BtStackProbe.extractElf32Info(elf);
         assertTrue("ELF32 info non-null", info != null);
@@ -480,6 +523,10 @@ public final class Bvm02UnitTests {
 
         assertEquals("imported symbol count", 1, info.importedSymbols.size());
         assertEqualsStr("import[0]", "ioctl", info.importedSymbols.get(0));
+
+        assertEquals("rodata string count", 2, info.rodataStrings.size());
+        assertEqualsStr("rodata[0]", "/dev/tcc_bt_dev", info.rodataStrings.get(0));
+        assertEqualsStr("rodata[1]", "Failed to get Bluetooth GATT Interface", info.rodataStrings.get(1));
 
         // 3. Reject malformed / non-ELF32 buffers safely without throwing
         assertTrue("null ELF returns null", BtStackProbe.extractElf32Info(null) == null);

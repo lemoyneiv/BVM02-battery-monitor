@@ -29,6 +29,10 @@ public final class BtBleBridgeServer {
 
     public static void setModEnabled(boolean enabled) {
         modEnabled = enabled;
+        if (!enabled) {
+            BleGattSessionManager.getInstance().onModDisabled();
+            BtNativeBridge.shutdown();
+        }
     }
 
     public static void startIfNeeded(final ModContext mod, final LoadedApp app) {
@@ -47,30 +51,33 @@ public final class BtBleBridgeServer {
         t.start();
     }
 
-    private static void runAcceptLoop(ModContext mod, LoadedApp app) {
+    private static void runAcceptLoop(final ModContext mod, final LoadedApp app) {
         LocalServerSocket server = null;
         try {
             server = new LocalServerSocket(SOCKET_NAME);
             if (mod != null) {
-                mod.log("BtBleBridgeServer listening on abstract @" + SOCKET_NAME
+                mod.log("BtBleBridgeServer v0.2.0 listening on abstract @" + SOCKET_NAME
                         + " in " + (app != null ? app.processName : "com.android.bluetooth"));
             }
             while (true) {
-                LocalSocket client = null;
-                try {
-                    client = server.accept();
-                    if (client != null) {
-                        handleClient(mod, client);
+                final LocalSocket client = server.accept();
+                if (client == null) continue;
+                Thread clientThread = new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        try {
+                            handleClient(mod, app, client);
+                        } catch (Throwable clientErr) {
+                            if (mod != null) {
+                                mod.log("BtBleBridgeServer client err: " + clientErr);
+                            }
+                        } finally {
+                            try { client.close(); } catch (Throwable ignored) {}
+                        }
                     }
-                } catch (Throwable clientErr) {
-                    if (mod != null) {
-                        mod.log("BtBleBridgeServer client err: " + clientErr);
-                    }
-                } finally {
-                    if (client != null) {
-                        try { client.close(); } catch (Throwable ignored) {}
-                    }
-                }
+                }, "Bvm02BleClient");
+                clientThread.setDaemon(true);
+                clientThread.start();
             }
         } catch (Throwable bindErr) {
             STARTED.set(false);
@@ -84,7 +91,7 @@ public final class BtBleBridgeServer {
         }
     }
 
-    private static void handleClient(ModContext mod, LocalSocket client) throws Exception {
+    private static void handleClient(ModContext mod, LoadedApp app, LocalSocket client) throws Exception {
         client.setSoTimeout(2500);
         Credentials creds = client.getPeerCredentials();
         int uid = (creds != null) ? creds.getUid() : -1;
@@ -99,24 +106,49 @@ public final class BtBleBridgeServer {
             return;
         }
         cmd = cmd.trim();
+        boolean isEnabled = modEnabled && (mod == null || mod.enabled());
+
+        if ("STREAM_SESSION".equals(cmd)) {
+            if (!isEnabled) {
+                os.write("ERR MOD_DISABLED\n".getBytes(UTF8));
+                os.flush();
+                return;
+            }
+            if (!BtNativeBridge.ensureInitialized(mod, app)) {
+                String status = BtNativeBridge.describeStatus(mod, app);
+                os.write(("ERR BRIDGE_INIT_FAILED " + status + "\n").getBytes(UTF8));
+                os.flush();
+                return;
+            }
+            client.setSoTimeout(0);
+            BleGattSessionManager.getInstance().runStreamSession(mod, reader, os);
+            return;
+        }
 
         StringBuilder resp = new StringBuilder(512);
         if ("PING".equals(cmd)) {
-            resp.append("OK PONG version=0.1.6 pid=")
+            resp.append("OK PONG version=0.2.0 pid=")
                     .append(android.os.Process.myPid())
                     .append(" uid=")
                     .append(android.os.Process.myUid())
                     .append(" enabled=")
-                    .append(modEnabled && (mod == null || mod.enabled()))
+                    .append(isEnabled)
                     .append('\n');
+        } else if ("BRIDGE_STATUS".equals(cmd)) {
+            if (!isEnabled) {
+                resp.append("BRIDGE: status=MOD_DISABLED\n");
+            } else {
+                resp.append("BRIDGE: ").append(BtNativeBridge.describeStatus(mod, app)).append('\n');
+            }
         } else if ("CAPS".equals(cmd)) {
-            if (!modEnabled || (mod != null && !mod.enabled())) {
+            if (!isEnabled) {
                 resp.append("CAPS: status=MOD_DISABLED\n");
             } else {
                 List<String> lines = BtMemInspector.inspectLiveCapabilities(mod);
                 for (int i = 0; i < lines.size(); i++) {
                     resp.append("CAPS: ").append(lines.get(i)).append('\n');
                 }
+                resp.append("CAPS: jni_bridge=").append(BtNativeBridge.describeStatus(mod, app)).append('\n');
             }
         } else {
             resp.append("ERR UNKNOWN_CMD\n");

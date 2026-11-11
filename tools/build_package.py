@@ -157,8 +157,95 @@ subprocess.run(cmd_r8, check=True)
 dex_file = os.path.join(BUILD_DIR, "dex", "classes.dex")
 print("  Generated classes.dex (", os.path.getsize(dex_file), "bytes)")
 
-# 4. Package resources with aapt
-print("\n[4/7] Packaging APK resources via aapt...")
+# 4. Build ARMv7 JNI library (libbvm02_ble.so) & package APK resources with aapt
+print("\n[4/7] Compiling ARMv7 JNI library (libbvm02_ble.so) & packaging APK resources...")
+native_src = os.path.join(BASE_DIR, "hook", "native", "bvm02_ble_jni.c")
+prebuilt_so = os.path.join(BASE_DIR, "hook", "prebuilt", "armeabi-v7a", "libbvm02_ble.so")
+built_so = os.path.join(BUILD_DIR, "native", "libbvm02_ble.so")
+os.makedirs(os.path.dirname(built_so), exist_ok=True)
+
+clang_bin = shutil.which("clang")
+lld_bin = shutil.which("ld.lld") or shutil.which("lld")
+if clang_bin and lld_bin and os.path.isfile(native_src):
+    stub_dir = os.path.join(BUILD_DIR, "native", "syslib-stubs")
+    os.makedirs(stub_dir, exist_ok=True)
+    stub_specs = [
+        ("libc", ["close", "dup", "fcntl", "memcpy", "memset", "pthread_create", "pthread_detach", "read", "usleep", "write"]),
+        ("libdl", ["dlerror", "dlopen", "dlsym"]),
+        ("liblog", ["__android_log_print"]),
+    ]
+    stub_sos = []
+    for lib_name, syms in stub_specs:
+        stub_c = os.path.join(stub_dir, f"{lib_name}.c")
+        with open(stub_c, "w", encoding="utf-8") as sf:
+            for sym in syms:
+                sf.write(f"void {sym}(void) {{}}\n")
+            if lib_name == "libc":
+                sf.write("char __dso_handle, _edata, __bss_start, _end;\n")
+        stub_so = os.path.join(stub_dir, f"{lib_name}.so")
+        subprocess.run(
+            [
+                clang_bin,
+                "--target=armv7a-linux-androideabi",
+                "-mthumb",
+                "-march=armv7-a",
+                "-mfloat-abi=softfp",
+                "-fPIC",
+                "-ffreestanding",
+                "-fno-builtin",
+                "-nostdlib",
+                "-shared",
+                "-fuse-ld=lld",
+                "-Wl,--hash-style=sysv",
+                "-Wl,--build-id=none",
+                f"-Wl,-soname,{lib_name}.so",
+                "-o",
+                stub_so,
+                stub_c,
+            ],
+            check=True,
+        )
+        stub_sos.append(stub_so)
+
+    subprocess.run(
+        [
+            clang_bin,
+            "--target=armv7a-linux-androideabi",
+            "-mthumb",
+            "-march=armv7-a",
+            "-mfloat-abi=softfp",
+            "-Os",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-fPIC",
+            "-ffreestanding",
+            "-fno-builtin",
+            "-fno-stack-protector",
+            "-fvisibility=hidden",
+            "-nostdlib",
+            "-shared",
+            "-fuse-ld=lld",
+            "-Wl,--hash-style=sysv",
+            "-Wl,-z,defs",
+            "-Wl,--build-id=none",
+            "-Wl,-soname,libbvm02_ble.so",
+            "-o",
+            built_so,
+            native_src,
+        ]
+        + stub_sos,
+        check=True,
+    )
+    os.makedirs(os.path.dirname(prebuilt_so), exist_ok=True)
+    shutil.copy2(built_so, prebuilt_so)
+    print("  Compiled ARMv7 libbvm02_ble.so via clang+lld (", os.path.getsize(built_so), "bytes)")
+elif os.path.isfile(prebuilt_so):
+    shutil.copy2(prebuilt_so, built_so)
+    print("  Using prebuilt ARMv7 libbvm02_ble.so (", os.path.getsize(built_so), "bytes)")
+else:
+    raise RuntimeError("Neither clang+lld nor prebuilt hook/prebuilt/armeabi-v7a/libbvm02_ble.so is available!")
+
 unsigned_apk = os.path.join(BUILD_DIR, "unsigned.apk")
 cmd_aapt = [
     AAPT,
@@ -177,7 +264,9 @@ subprocess.run(cmd_aapt, check=True)
 
 with zipfile.ZipFile(unsigned_apk, "a", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as z:
     z.write(dex_file, "classes.dex", compress_type=zipfile.ZIP_DEFLATED)
-print("  Injected classes.dex into APK.")
+    z.write(built_so, "lib/armeabi-v7a/libbvm02_ble.so", compress_type=zipfile.ZIP_DEFLATED)
+    z.write(built_so, "lib/armeabi/libbvm02_ble.so", compress_type=zipfile.ZIP_DEFLATED)
+print("  Injected classes.dex and lib/armeabi-v7a/libbvm02_ble.so into APK.")
 
 # 5. Zipalign & Sign APK (strictly v1 JAR signature for Android 4.4.2 KitKat)
 print("\n[5/7] Zipaligning & signing APK (v1 JAR signature)...")

@@ -286,6 +286,49 @@ def test_apk_alignment_and_v1_signature() -> None:
         fail(f"Expected minSdkVersion=19 and targetSdkVersion=19:\n{badging}")
     print("  [OK] AndroidManifest badging verified (package=bvm02.app, minSdk=19, targetSdk=19)")
 
+    with zipfile.ZipFile(APK_PATH, "r") as zf:
+        apk_entries = set(zf.namelist())
+        for req_so in ("lib/armeabi-v7a/libbvm02_ble.so", "lib/armeabi/libbvm02_ble.so"):
+            if req_so not in apk_entries:
+                fail(f"APK missing required ARMv7 JNI library entry: {req_so}")
+        so_bytes = zf.read("lib/armeabi-v7a/libbvm02_ble.so")
+        if so_bytes[:7] != b"\x7fELF\x01\x01\x01":
+            fail("libbvm02_ble.so is not an ELF32 LSB shared library")
+        e_type = int.from_bytes(so_bytes[16:18], "little")
+        e_machine = int.from_bytes(so_bytes[18:20], "little")
+        if e_type != 3 or e_machine != 40:
+            fail(f"libbvm02_ble.so expected ET_DYN(3)/EM_ARM(40), got type={e_type} machine={e_machine}")
+
+        # Verify PT_DYNAMIC contains SysV DT_HASH (tag=4), mandatory for Android 4.4 KitKat /system/bin/linker
+        e_phoff = int.from_bytes(so_bytes[28:32], "little")
+        e_phentsize = int.from_bytes(so_bytes[42:44], "little")
+        e_phnum = int.from_bytes(so_bytes[44:46], "little")
+        has_sysv_dt_hash = False
+        for idx in range(e_phnum):
+            poff = e_phoff + idx * e_phentsize
+            p_type = int.from_bytes(so_bytes[poff : poff + 4], "little")
+            if p_type == 2:  # PT_DYNAMIC
+                dyn_off = int.from_bytes(so_bytes[poff + 4 : poff + 8], "little")
+                dyn_sz = int.from_bytes(so_bytes[poff + 16 : poff + 20], "little")
+                for doff in range(dyn_off, dyn_off + dyn_sz, 8):
+                    d_tag = int.from_bytes(so_bytes[doff : doff + 4], "little", signed=True)
+                    if d_tag == 0:
+                        break
+                    if d_tag == 4:  # DT_HASH (SysV)
+                        has_sysv_dt_hash = True
+        if not has_sysv_dt_hash:
+            fail("libbvm02_ble.so is missing SysV DT_HASH (tag=4) required by Android 4.4 KitKat linker!")
+
+        for sym in (
+            b"Java_bvm02_hook_BtNativeBridge_nativeInit",
+            b"Java_bvm02_hook_BtNativeBridge_nativeSetState",
+            b"Java_bvm02_hook_BtNativeBridge_nativeGetStat",
+            b"Java_bvm02_hook_BtNativeBridge_nativeShutdown",
+        ):
+            if sym not in so_bytes:
+                fail(f"libbvm02_ble.so missing required JNI export {sym.decode('ascii')}")
+    print(f"  [OK] ARMv7 JNI libbvm02_ble.so ({len(so_bytes):,} bytes) ELF32 EM_ARM, SysV DT_HASH & JNI exports verified")
+
 
 def test_distribution_archives_and_hmg_signature() -> None:
     step("5. HMG-API & NEMESIS Distribution Archives + ECDSA Signature Verification")

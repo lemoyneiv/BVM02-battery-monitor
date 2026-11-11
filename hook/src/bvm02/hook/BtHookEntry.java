@@ -25,7 +25,7 @@ public final class BtHookEntry extends ModEntry {
             return;
         }
         if (mod != null) {
-            mod.log("BtHookEntry v0.1.6 active in " + app.processName
+            mod.log("BtHookEntry v0.2.0 active in " + app.processName
                     + " (pid=" + android.os.Process.myPid()
                     + ", uid=" + android.os.Process.myUid() + ")");
         }

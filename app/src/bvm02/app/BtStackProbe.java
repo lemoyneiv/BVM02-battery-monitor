@@ -37,7 +37,7 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
 /**
- * Strictly passive, read-only, in-RAM Gen5W Bluetooth, HAL, DEX bytecode & ELF32 stack introspector (v0.1.6).
+ * Strictly passive, read-only, in-RAM Gen5W Bluetooth, HAL, DEX bytecode & ELF32 stack introspector (v0.2.0).
  *
  * SAFETY INVARIANTS (Gen5W Telechips TCC803x tcc.solution.bluetooth.mbox=1):
  *  - NEVER invokes @hide Binder IPC methods on system_server (never calls enableGatt, enableRadio,
@@ -352,7 +352,7 @@ public final class BtStackProbe {
     }
 
     private static void runProbeInternal(Context ctx) {
-        DiagLogger.log("BT_PROBE", "=== BEGIN PASSIVE GEN5W BLUETOOTH HAL, DEX & ELF32 STACK PROBE (v0.1.6) ===");
+        DiagLogger.log("BT_PROBE", "=== BEGIN PASSIVE GEN5W BLUETOOTH HAL, DEX & ELF32 STACK PROBE (v0.2.0) ===");
 
         BluetoothAdapter adapter = null;
         try {
@@ -377,7 +377,7 @@ public final class BtStackProbe {
         // 4. HMG-API read-only root snapshot (/proc/<bt_pid>/maps, /proc/<bt_pid>/fd, HMG-API log, HAL dirs, init.*.rc)
         Set<String> mappedSoPaths = probeRootProcessMapsAndHal();
 
-        // 5. Live @bvm02_ble hook bridge inside com.android.bluetooth (live Broadcom LMP/HCI LE capabilities & bt_hc_cbacks)
+        // 5. Live @bvm02_ble hook bridge inside com.android.bluetooth (live Broadcom LMP/HCI LE capabilities & JNI bridge)
         probeLiveBluetoothHookBridge();
 
         // 6. /system/etc/bluetooth/bt_stack.conf + /system/app/Bluetooth.apk boolean config & Dalvik bytecode X-ray
@@ -393,7 +393,7 @@ public final class BtStackProbe {
         // 9. Unfiltered HAL directories, /dev nodes, USB sysfs, props & processes
         probeSystemFilesAndDaemons();
 
-        DiagLogger.log("BT_PROBE", "=== END PASSIVE GEN5W BLUETOOTH HAL, DEX & ELF32 STACK PROBE (v0.1.6) ===");
+        DiagLogger.log("BT_PROBE", "=== END PASSIVE GEN5W BLUETOOTH HAL, DEX & ELF32 STACK PROBE (v0.2.0) ===");
     }
 
     private static void probeLiveBluetoothHookBridge() {
@@ -406,6 +406,13 @@ public final class BtStackProbe {
         }
         for (int i = 0; i < ping.lines.size(); i++) {
             DiagLogger.log("BT_HOOK", "  PING: " + redactMacOctets(ping.lines.get(i)));
+        }
+
+        BtBleBridgeClient.BridgeResponse bridgeSt = BtBleBridgeClient.sendCommand("BRIDGE_STATUS");
+        if (bridgeSt.connected) {
+            for (int i = 0; i < bridgeSt.lines.size(); i++) {
+                DiagLogger.log("BT_HOOK", "  " + redactMacOctets(bridgeSt.lines.get(i)));
+            }
         }
 
         BtBleBridgeClient.BridgeResponse caps = BtBleBridgeClient.sendCommand("CAPS");

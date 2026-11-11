@@ -131,11 +131,13 @@ public final class BleClient {
     private BluetoothManager btManager;
     private BluetoothAdapter btAdapter;
 
-    // BLE / Dual-Mode Scanner state
+    // BLE / Dual-Mode / @bvm02_ble Bridge Scanner state
     private boolean isScanning = false;
     private boolean usingDiscoveryFallback = false;
+    private boolean usingBridgeBackend = false;
     private boolean discoveryReceiverRegistered = false;
     private final Map<String, ScannedDevice> scannedMap = new LinkedHashMap<String, ScannedDevice>();
+    private final Map<String, Integer> bridgeAddrTypes = new LinkedHashMap<String, Integer>();
 
     // Active GATT connection state (guarded on mainHandler)
     private final AtomicInteger connGeneration = new AtomicInteger(0);
@@ -143,6 +145,10 @@ public final class BleClient {
     private SensorConfig activeSensor = null;
     private BluetoothGatt activeGatt = null;
     private BluetoothGattService activeServiceFff0 = null;
+    private BtBleBridgeClient.StreamSession activeBridgeSession = null;
+    private Runnable pendingBridgeReadyAction = null;
+    private boolean bridgeServiceReady = false;
+    private final Map<UUID, Integer> bridgeCharProps = new LinkedHashMap<UUID, Integer>();
     private final Bvm02Protocol.FrameAssembler rxAssembler = new Bvm02Protocol.FrameAssembler();
     private boolean retriedStatus133 = false;
 
@@ -229,7 +235,7 @@ public final class BleClient {
      */
     public String buildHardwareSummary() {
         refreshAdapterReferences();
-        StringBuilder sb = new StringBuilder(440);
+        StringBuilder sb = new StringBuilder(520);
         boolean hasFeatureXml = false;
         try {
             hasFeatureXml = appContext.getPackageManager()
@@ -260,12 +266,16 @@ public final class BleClient {
             sb.append("Adapter query warning: ").append(t.getMessage()).append('\n');
         }
 
+        boolean bridgeOpen = activeBridgeSession != null && activeBridgeSession.isOpen();
         sb.append("Adapter: ").append(name).append(" [").append(addr).append("]  State=").append(adapterStateStr(state))
                 .append("  BLE_XML=").append(hasFeatureXml).append('\n');
         sb.append("Classic BT Coexistence: HFP=").append(profileStateStr(hfp))
                 .append("  A2DP=").append(profileStateStr(a2dp))
                 .append("  Bonded=").append(bondedCount).append('\n');
-        sb.append("Binder Stack: ").append(BtStackProbe.checkIBluetoothGattStatus(btAdapter)).append('\n');
+        sb.append("BLE Transport: ").append(BtStackProbe.getLiveIBluetoothGatt(btAdapter) != null
+                ? "Android IBluetoothGatt"
+                : ("@bvm02_ble Direct HCI/ATT Bridge (" + (bridgeOpen ? "CONNECTED" : "STANDBY") + ")"))
+                .append('\n');
         sb.append("GATT Session: ").append(connState.name())
                 .append(activeSensor != null ? (" (" + activeSensor.mac + ")") : "")
                 .append("  |  Reads=").append(rxReadCount)
@@ -281,8 +291,9 @@ public final class BleClient {
         @Override
         public void run() {
             if (isScanning) {
-                DiagLogger.log("BLE_SCAN", "Scan window completed (mode="
-                        + (usingDiscoveryFallback ? "startDiscovery" : "startLeScan")
+                String mode = usingBridgeBackend ? "@bvm02_ble HCI LE"
+                        : (usingDiscoveryFallback ? "startDiscovery" : "startLeScan");
+                DiagLogger.log("BLE_SCAN", "Scan window completed (mode=" + mode
                         + "). Total peripherals seen: " + scannedMap.size());
                 stopScan();
             }
@@ -476,19 +487,33 @@ public final class BleClient {
 
                 scannedMap.clear();
                 usingDiscoveryFallback = false;
+                usingBridgeBackend = false;
                 listener.onScanResultsUpdated(Collections.<ScannedDevice>emptyList());
 
                 if (BtStackProbe.getLiveIBluetoothGatt(btAdapter) == null) {
-                    isScanning = false;
-                    DiagLogger.log("BLE_SCAN", "IBluetoothGatt is NULL ("
-                            + BtStackProbe.checkIBluetoothGattStatus(btAdapter)
-                            + "). Skipping BLE scan to keep system_server safe; open BT Diagnostics -> Probe BT Stack & Export Log.");
-                    listener.onScanStateChanged(false,
-                            "IBluetoothGatt=NULL on this firmware (Telechips BT mbox) — open BT Diagnostics -> Probe BT Stack & Export Log.");
+                    startBridgeScan();
                     return;
                 }
 
                 executeScanWithCurrentStack();
+            }
+        });
+    }
+
+    private void startBridgeScan() {
+        isScanning = true;
+        usingBridgeBackend = true;
+        usingDiscoveryFallback = false;
+        DiagLogger.log("BLE_SCAN", "IBluetoothGatt is NULL -> starting direct HCI LE active scan via @bvm02_ble...");
+        listener.onScanStateChanged(true, "Connecting to @bvm02_ble HCI LE scanner...");
+        mainHandler.removeCallbacks(stopScanTimeoutRunnable);
+        mainHandler.postDelayed(stopScanTimeoutRunnable, SCAN_DURATION_MS + 1500L);
+
+        ensureBridgeSessionAndRun(new Runnable() {
+            @Override
+            public void run() {
+                if (!isScanning || !usingBridgeBackend || activeBridgeSession == null) return;
+                activeBridgeSession.sendLine("SCAN_START");
             }
         });
     }
@@ -581,8 +606,15 @@ public final class BleClient {
         mainHandler.removeCallbacks(stopScanTimeoutRunnable);
         boolean wasScanning = isScanning;
         boolean wasFallback = usingDiscoveryFallback;
+        boolean wasBridge = usingBridgeBackend;
 
-        if (btAdapter != null) {
+        if (wasScanning && wasBridge) {
+            pendingBridgeReadyAction = null;
+            if (activeBridgeSession != null && activeBridgeSession.isOpen()) {
+                activeBridgeSession.sendLine("SCAN_STOP");
+                DiagLogger.log("BLE_SCAN", "Stopped @bvm02_ble HCI LE scan.");
+            }
+        } else if (btAdapter != null) {
             if (wasScanning && !wasFallback) {
                 try {
                     btAdapter.stopLeScan(leScanCallback);
@@ -687,26 +719,8 @@ public final class BleClient {
         // Stop LE scan & cancel inquiry discovery before GATT connect
         stopScanInternal(true);
 
-        // Cleanly tear down any previous GATT session & release clientIf slot
+        // Cleanly tear down any previous GATT session & release clientIf / LE handle
         closeGattInternal();
-
-        if (BtStackProbe.getLiveIBluetoothGatt(btAdapter) == null) {
-            DiagLogger.log("GATT_ERR", "Cannot connectGatt to " + sensor.mac
-                    + ": IBluetoothGatt is NULL on this firmware ("
-                    + BtStackProbe.checkIBluetoothGattStatus(btAdapter) + ")");
-            updateConnState(ConnState.DISCONNECTED, sensor,
-                    "IBluetoothGatt=NULL on firmware — open BT Diagnostics -> Probe BT Stack");
-            return;
-        }
-
-        final BluetoothDevice remote;
-        try {
-            remote = btAdapter.getRemoteDevice(sensor.mac);
-        } catch (Throwable t) {
-            DiagLogger.log("GATT_ERR", "Invalid Bluetooth MAC '" + sensor.mac + "': " + t.getMessage());
-            updateConnState(ConnState.DISCONNECTED, sensor, "Invalid MAC: " + sensor.mac);
-            return;
-        }
 
         activeSensor = sensor;
         activeFwVersion = 0.0f;
@@ -716,8 +730,60 @@ public final class BleClient {
         rxAssembler.reset();
 
         final int gen = connGeneration.incrementAndGet();
+
+        if (BtStackProbe.getLiveIBluetoothGatt(btAdapter) == null) {
+            connectViaBridge(gen, sensor);
+            return;
+        }
+
+        usingBridgeBackend = false;
+        final BluetoothDevice remote;
+        try {
+            remote = btAdapter.getRemoteDevice(sensor.mac);
+        } catch (Throwable t) {
+            DiagLogger.log("GATT_ERR", "Invalid Bluetooth MAC '" + sensor.mac + "': " + t.getMessage());
+            updateConnState(ConnState.DISCONNECTED, sensor, "Invalid MAC: " + sensor.mac);
+            return;
+        }
+
         updateConnState(ConnState.CONNECTING, sensor, "Connecting to " + sensor.getDisplayName() + "...");
         performConnectGatt(gen, sensor, remote);
+    }
+
+    private void connectViaBridge(final int gen, final SensorConfig sensor) {
+        usingBridgeBackend = true;
+        bridgeServiceReady = false;
+        bridgeCharProps.clear();
+
+        final String upperMac = sensor.mac.toUpperCase(Locale.US);
+        Integer cachedAddrType = bridgeAddrTypes.get(upperMac);
+        final int addrType = (cachedAddrType != null) ? cachedAddrType.intValue() : -1;
+
+        DiagLogger.log("GATT", "Connecting via @bvm02_ble direct HCI/ATT Central to "
+                + upperMac + " [gen=" + gen + ", addrType=" + addrType + "]");
+        updateConnState(ConnState.CONNECTING, sensor, "Connecting to " + sensor.getDisplayName() + "...");
+
+        ensureBridgeSessionAndRun(new Runnable() {
+            @Override
+            public void run() {
+                if (connGeneration.get() != gen || activeBridgeSession == null) return;
+                activeBridgeSession.sendLine("CONNECT " + upperMac + " " + addrType);
+            }
+        });
+
+        mainHandler.postDelayed(new Runnable() {
+            @Override
+            public void run() {
+                if (connGeneration.get() == gen
+                        && (connState == ConnState.CONNECTING || connState == ConnState.DISCOVERING)) {
+                    gattErrorCount++;
+                    DiagLogger.log("GATT_TIMEOUT", "@bvm02_ble connection timed out for " + upperMac);
+                    closeGattInternal();
+                    updateConnState(ConnState.DISCONNECTED, sensor,
+                            "Connection timed out — ensure sensor is in range & phone app is closed");
+                }
+            }
+        }, 15000L);
     }
 
     private void performConnectGatt(final int gen, final SensorConfig sensor, final BluetoothDevice remote) {
@@ -795,18 +861,26 @@ public final class BleClient {
 
     public void shutdown() {
         if (Looper.myLooper() == Looper.getMainLooper()) {
-            stopScanInternal(false);
-            unregisterDiscoveryReceiver();
-            closeGattInternal();
+            shutdownOnMain();
         } else {
             mainHandler.post(new Runnable() {
                 @Override
                 public void run() {
-                    stopScanInternal(false);
-                    unregisterDiscoveryReceiver();
-                    closeGattInternal();
+                    shutdownOnMain();
                 }
             });
+        }
+    }
+
+    private void shutdownOnMain() {
+        stopScanInternal(false);
+        unregisterDiscoveryReceiver();
+        closeGattInternal();
+        if (activeBridgeSession != null) {
+            BtBleBridgeClient.StreamSession s = activeBridgeSession;
+            activeBridgeSession = null;
+            pendingBridgeReadyAction = null;
+            s.close();
         }
     }
 
@@ -818,6 +892,15 @@ public final class BleClient {
         inflightOp = null;
         activeServiceFff0 = null;
         rxAssembler.reset();
+
+        if (bridgeServiceReady || (usingBridgeBackend && connState != ConnState.DISCONNECTED)) {
+            bridgeServiceReady = false;
+            bridgeCharProps.clear();
+            if (activeBridgeSession != null && activeBridgeSession.isOpen()) {
+                activeBridgeSession.sendLine("DISCONNECT");
+                DiagLogger.log("GATT", "@bvm02_ble BLE session disconnected cleanly.");
+            }
+        }
 
         if (activeGatt != null) {
             BluetoothGatt g = activeGatt;
@@ -831,6 +914,256 @@ public final class BleClient {
             } catch (Throwable t) {
                 DiagLogger.log("GATT_WARN", "BluetoothGatt.close() warning: " + t.getMessage());
             }
+        }
+    }
+
+    // ================= @bvm02_ble DIRECT HCI/ATT BRIDGE CLIENT =================
+
+    private void ensureBridgeSessionAndRun(final Runnable onReady) {
+        if (activeBridgeSession != null && activeBridgeSession.isOpen()) {
+            onReady.run();
+            return;
+        }
+        pendingBridgeReadyAction = onReady;
+        if (activeBridgeSession != null) {
+            return; // Handshake already in progress
+        }
+
+        final BtBleBridgeClient.StreamSession[] holder = new BtBleBridgeClient.StreamSession[1];
+        BtBleBridgeClient.StreamSession session = BtBleBridgeClient.openStreamSession(
+                new BtBleBridgeClient.StreamListener() {
+                    @Override
+                    public void onSessionReady(final String bannerLine) {
+                        mainHandler.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                if (activeBridgeSession != holder[0]) return;
+                                DiagLogger.log("BT_BRIDGE", "@bvm02_ble stream active: " + bannerLine);
+                                Runnable r = pendingBridgeReadyAction;
+                                pendingBridgeReadyAction = null;
+                                if (r != null) {
+                                    r.run();
+                                }
+                            }
+                        });
+                    }
+
+                    @Override
+                    public void onSessionLine(final String line) {
+                        mainHandler.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                if (activeBridgeSession != holder[0]) return;
+                                handleBridgeLine(line);
+                            }
+                        });
+                    }
+
+                    @Override
+                    public void onSessionClosed(final String reason) {
+                        mainHandler.post(new Runnable() {
+                            @Override
+                            public void run() {
+                                if (activeBridgeSession != holder[0]) return;
+                                activeBridgeSession = null;
+                                pendingBridgeReadyAction = null;
+                                bridgeServiceReady = false;
+                                bridgeCharProps.clear();
+                                DiagLogger.log("BT_BRIDGE", "@bvm02_ble stream closed: " + reason);
+                                if (isScanning && usingBridgeBackend) {
+                                    isScanning = false;
+                                    mainHandler.removeCallbacks(stopScanTimeoutRunnable);
+                                    listener.onScanStateChanged(false,
+                                            "@bvm02_ble unavailable (" + reason + ") — reboot head unit after mod install.");
+                                }
+                                if (usingBridgeBackend && connState != ConnState.DISCONNECTED) {
+                                    SensorConfig prev = activeSensor;
+                                    closeGattInternal();
+                                    updateConnState(ConnState.DISCONNECTED, prev,
+                                            "BLE bridge closed (" + reason + ")");
+                                }
+                            }
+                        });
+                    }
+                });
+        holder[0] = session;
+        activeBridgeSession = session;
+    }
+
+    private void handleBridgeLine(String line) {
+        if (line == null || line.isEmpty()) return;
+
+        if (line.startsWith("SCAN_STATE ")) {
+            String rest = line.substring("SCAN_STATE ".length()).trim();
+            if ("1".equals(rest)) {
+                if (isScanning && usingBridgeBackend) {
+                    DiagLogger.log("BLE_SCAN", "@bvm02_ble HCI LE active scan running (12s)...");
+                    listener.onScanStateChanged(true, "Scanning BLE peripherals via @bvm02_ble HCI LE (12s)...");
+                }
+            } else if (rest.startsWith("0 ") && isScanning && usingBridgeBackend) {
+                String err = rest.substring(2).trim();
+                isScanning = false;
+                mainHandler.removeCallbacks(stopScanTimeoutRunnable);
+                DiagLogger.log("BLE_SCAN", "@bvm02_ble scan failed: " + err);
+                listener.onScanStateChanged(false, "BLE scan error (" + err + ") — check BT Diagnostics.");
+            }
+            return;
+        }
+
+        if (line.startsWith("ADV ")) {
+            if (!isScanning || !usingBridgeBackend) return;
+            String[] parts = line.split("\\s+");
+            if (parts.length < 5) return;
+            String upperMac = parts[1].toUpperCase(Locale.US);
+            int addrType = 0;
+            int rssi = -75;
+            try { addrType = Integer.parseInt(parts[2]); } catch (NumberFormatException ignored) {}
+            try { rssi = Integer.parseInt(parts[3]); } catch (NumberFormatException ignored) {}
+            byte[] recCopy = decodeHexOrEmpty(parts[4]);
+
+            bridgeAddrTypes.put(upperMac, Integer.valueOf(addrType));
+            ScannedDevice prev = scannedMap.get(upperMac);
+            String advName = Bvm02Protocol.parseAdvertisedName(recCopy);
+            String resolvedName = (advName != null && !advName.trim().isEmpty())
+                    ? advName.trim()
+                    : (prev != null ? prev.name : "");
+            boolean hasFff0 = Bvm02Protocol.hasAdvertisedServiceFff0(recCopy)
+                    || (prev != null && prev.hasServiceFff0);
+            boolean isMatch = Bvm02Protocol.isLikelyBvm02Device(resolvedName, recCopy) || hasFff0;
+            String hexPreview = buildAdvPreview(recCopy);
+            if (hexPreview.isEmpty() && prev != null) {
+                hexPreview = prev.advHexPreview;
+            }
+
+            boolean isNew = (prev == null);
+            boolean nameNewlyResolved = (prev != null && prev.name.isEmpty() && !resolvedName.isEmpty());
+
+            ScannedDevice entry = new ScannedDevice(
+                    upperMac,
+                    resolvedName,
+                    rssi,
+                    isMatch,
+                    hasFff0,
+                    hexPreview,
+                    SystemClock.elapsedRealtime(),
+                    BluetoothDevice.DEVICE_TYPE_LE,
+                    false
+            );
+            scannedMap.put(upperMac, entry);
+
+            if (isNew || nameNewlyResolved) {
+                DiagLogger.log("BLE_SCAN", (isNew ? "Discovered BLE peripheral: " : "Resolved SCAN_RSP name: ")
+                        + "name='" + (resolvedName.isEmpty() ? "<unnamed>" : resolvedName)
+                        + "' mac=" + upperMac
+                        + " addrType=" + (addrType == 1 ? "RANDOM" : "PUBLIC")
+                        + " rssi=" + rssi + "dBm"
+                        + " bvm02Match=" + isMatch
+                        + " fff0=" + hasFff0
+                        + " adv=[" + hexPreview + "]");
+            }
+            listener.onScanResultsUpdated(getSortedScanResults());
+            return;
+        }
+
+        if (line.startsWith("CONN_STATE ")) {
+            String[] parts = line.split("\\s+");
+            if (parts.length < 3) return;
+            String st = parts[1];
+            if ("DISCOVERING".equals(st)) {
+                if (usingBridgeBackend && activeSensor != null && connState == ConnState.CONNECTING) {
+                    DiagLogger.log("GATT_STATE", "@bvm02_ble connected (" + line + ")");
+                    updateConnState(ConnState.DISCOVERING, activeSensor, "Connected — discovering GATT services...");
+                }
+            } else if ("DISCONNECTED".equals(st)) {
+                if (usingBridgeBackend && connState != ConnState.DISCONNECTED) {
+                    SensorConfig prev = activeSensor;
+                    DiagLogger.log("GATT_STATE", "@bvm02_ble disconnected: " + line);
+                    if (!line.contains("reason=USER_REQUESTED") && !line.contains("reason=CANCELED")) {
+                        gattErrorCount++;
+                    }
+                    closeGattInternal();
+                    String msg = line.contains("CONNECT_TIMEOUT")
+                            ? "Connection timed out — ensure sensor is in range & phone app is closed"
+                            : (line.contains("MISSING_SERVICE_FFF0")
+                                    ? "Peripheral does not expose BVM02 service 0xFFF0"
+                                    : "Disconnected");
+                    updateConnState(ConnState.DISCONNECTED, prev, msg);
+                }
+            }
+            return;
+        }
+
+        if (line.startsWith("GATT_SVC ") || line.startsWith("GATT_CHAR ")) {
+            DiagLogger.log("GATT_TABLE", "@bvm02_ble " + line);
+            return;
+        }
+
+        if (line.startsWith("GATT_READY ")) {
+            if (!usingBridgeBackend || activeSensor == null) return;
+            String[] parts = line.split("\\s+");
+            String specCsv = (parts.length >= 3) ? parts[2] : "";
+            bridgeCharProps.clear();
+            bridgeCharProps.putAll(parseGattReadySpecs(specCsv));
+            bridgeServiceReady = true;
+            DiagLogger.log("GATT_SVC", "@bvm02_ble GATT table ready on " + activeSensor.mac + ": [" + specCsv + "]");
+
+            updateConnState(ConnState.HANDSHAKING, activeSensor, "Initializing BVM02 GATT channels...");
+            enqueueInitialHandshakeOps(
+                    activeSensor,
+                    bridgeCharProps.containsKey(Bvm02Protocol.UUID_CMD_NOTIFY),
+                    bridgeCharProps.containsKey(Bvm02Protocol.UUID_VERSION_INFO),
+                    bridgeCharProps.containsKey(Bvm02Protocol.UUID_DEVICE_NAME),
+                    bridgeCharProps.containsKey(Bvm02Protocol.UUID_CMD_WRITE)
+            );
+            return;
+        }
+
+        if (line.startsWith("OP_OK ")) {
+            String[] parts = line.split("\\s+");
+            if (parts.length >= 3) {
+                String kind = parts[1];
+                UUID uuid = expandShortUuid(parts[2]);
+                if ("READ_CHAR".equals(kind)) {
+                    byte[] data = decodeHexOrEmpty(parts.length >= 4 ? parts[3] : "-");
+                    rxReadCount++;
+                    if (activeSensor != null && uuid != null) {
+                        handleCharacteristicReadData(activeSensor, uuid, data);
+                    }
+                } else if ("WRITE_CHAR".equals(kind)) {
+                    txWriteCount++;
+                }
+            }
+            completeInflightOp();
+            return;
+        }
+
+        if (line.startsWith("OP_ERR ")) {
+            gattErrorCount++;
+            DiagLogger.log("GATT_ERR", "@bvm02_ble " + line);
+            completeInflightOp();
+            return;
+        }
+
+        if (line.startsWith("CHAR_NOTIFY ")) {
+            String[] parts = line.split("\\s+");
+            if (parts.length >= 4 && activeSensor != null) {
+                UUID uuid = expandShortUuid(parts[1]);
+                byte[] data = decodeHexOrEmpty(parts[2]);
+                // Wait: parts[0]="CHAR_NOTIFY", parts[1]=uuid, parts[2]=hex -> length >= 3!
+                rxNotifyCount++;
+                handleCharacteristicNotification(activeSensor, uuid, data);
+            } else if (parts.length == 3 && activeSensor != null) {
+                UUID uuid = expandShortUuid(parts[1]);
+                byte[] data = decodeHexOrEmpty(parts[2]);
+                rxNotifyCount++;
+                handleCharacteristicNotification(activeSensor, uuid, data);
+            }
+            return;
+        }
+
+        if (line.startsWith("ERR ")) {
+            gattErrorCount++;
+            DiagLogger.log("GATT_ERR", "@bvm02_ble " + line);
         }
     }
 
@@ -1027,24 +1360,37 @@ public final class BleClient {
         }
 
         updateConnState(ConnState.HANDSHAKING, sensor, "Initializing BVM02 GATT channels...");
+        enqueueInitialHandshakeOps(
+                sensor,
+                activeServiceFff0.getCharacteristic(Bvm02Protocol.UUID_CMD_NOTIFY) != null,
+                activeServiceFff0.getCharacteristic(Bvm02Protocol.UUID_VERSION_INFO) != null,
+                activeServiceFff0.getCharacteristic(Bvm02Protocol.UUID_DEVICE_NAME) != null,
+                activeServiceFff0.getCharacteristic(Bvm02Protocol.UUID_CMD_WRITE) != null
+        );
+    }
 
+    private void enqueueInitialHandshakeOps(SensorConfig sensor,
+                                            boolean hasNotifyFff4,
+                                            boolean hasVersionFff1,
+                                            boolean hasNameFff6,
+                                            boolean hasWriteFff3) {
         // 1. Enable notifications on 0xFFF4
-        if (activeServiceFff0.getCharacteristic(Bvm02Protocol.UUID_CMD_NOTIFY) != null) {
+        if (hasNotifyFff4) {
             enqueueOp(new GattOp(OpKind.ENABLE_NOTIFY, Bvm02Protocol.UUID_CMD_NOTIFY, null, "Enable 0xFFF4 Notify"));
         }
 
         // 2. Read firmware & hardware version on 0xFFF1 (strictly READ-ONLY)
-        if (activeServiceFff0.getCharacteristic(Bvm02Protocol.UUID_VERSION_INFO) != null) {
+        if (hasVersionFff1) {
             enqueueOp(new GattOp(OpKind.READ_CHAR, Bvm02Protocol.UUID_VERSION_INFO, null, "Read 0xFFF1 Version"));
         }
 
         // 3. Read remote UTF-8 name on 0xFFF6 if present
-        if (activeServiceFff0.getCharacteristic(Bvm02Protocol.UUID_DEVICE_NAME) != null) {
+        if (hasNameFff6) {
             enqueueOp(new GattOp(OpKind.READ_CHAR, Bvm02Protocol.UUID_DEVICE_NAME, null, "Read 0xFFF6 Name"));
         }
 
         // 4. Sync local wall-clock time (Cmd 0x01, non-MTU mode) and verify PIN (Cmd 0x36)
-        if (activeServiceFff0.getCharacteristic(Bvm02Protocol.UUID_CMD_WRITE) != null) {
+        if (hasWriteFff3) {
             enqueueCommandFrames(Bvm02Protocol.buildSyncTimeCmd(System.currentTimeMillis(), false), "Cmd 0x01 SyncTime");
             if (Bvm02Protocol.isValidPin(sensor.pin)) {
                 enqueueCommandFrames(Bvm02Protocol.buildVerifyPasswordCmd(sensor.pin), "Cmd 0x36 VerifyPIN");
@@ -1062,7 +1408,7 @@ public final class BleClient {
         mainHandler.post(new Runnable() {
             @Override
             public void run() {
-                if (activeGatt == null || activeServiceFff0 == null) return;
+                if (!isGattTransportReady()) return;
                 enqueueCommandFrames(Bvm02Protocol.buildSetPasswordCmd(newPin4), "Cmd 0x35 SetPIN");
             }
         });
@@ -1076,9 +1422,23 @@ public final class BleClient {
         }
     }
 
+    private boolean isGattTransportReady() {
+        if (usingBridgeBackend) {
+            return bridgeServiceReady && activeBridgeSession != null && activeBridgeSession.isOpen();
+        }
+        return activeGatt != null && activeServiceFff0 != null;
+    }
+
+    private boolean hasCharacteristicOnActiveSession(UUID uuid) {
+        if (usingBridgeBackend) {
+            return bridgeServiceReady && bridgeCharProps.containsKey(uuid);
+        }
+        return activeServiceFff0 != null && activeServiceFff0.getCharacteristic(uuid) != null;
+    }
+
     private void enqueueVoltageRead() {
-        if (activeServiceFff0 == null) return;
-        if (activeServiceFff0.getCharacteristic(Bvm02Protocol.UUID_READ_VOLTAGE) == null) return;
+        if (!isGattTransportReady()) return;
+        if (!hasCharacteristicOnActiveSession(Bvm02Protocol.UUID_READ_VOLTAGE)) return;
 
         // Avoid stacking duplicate 0xFFF2 reads if one is already queued
         for (GattOp op : opQueue) {
@@ -1092,7 +1452,7 @@ public final class BleClient {
     private final Runnable pollVoltageRunnable = new Runnable() {
         @Override
         public void run() {
-            if (activeGatt == null || activeServiceFff0 == null) return;
+            if (!isGattTransportReady()) return;
             enqueueVoltageRead();
             mainHandler.postDelayed(this, VOLTAGE_POLL_INTERVAL_MS);
         }
@@ -1127,12 +1487,35 @@ public final class BleClient {
 
     private void pumpNextOp() {
         if (inflightOp != null || opQueue.isEmpty()) return;
-        if (activeGatt == null || activeServiceFff0 == null) {
+        if (!isGattTransportReady()) {
             opQueue.clear();
             return;
         }
 
         GattOp op = opQueue.remove(0);
+        if (usingBridgeBackend) {
+            if (!bridgeCharProps.containsKey(op.charUuid)) {
+                pumpNextOp();
+                return;
+            }
+            inflightOp = op;
+            String u4 = shortHexUuid(op.charUuid);
+            if (op.kind == OpKind.ENABLE_NOTIFY) {
+                DiagLogger.log("GATT_OP", op.label + " -> @bvm02_ble ENABLE_NOTIFY " + u4);
+                activeBridgeSession.sendLine("ENABLE_NOTIFY " + u4);
+            } else if (op.kind == OpKind.READ_CHAR) {
+                activeBridgeSession.sendLine("READ_CHAR " + u4);
+            } else if (op.kind == OpKind.WRITE_CHAR) {
+                String hex = Bvm02Protocol.bytesToHex(op.writePayload).replace(" ", "");
+                DiagLogger.log("GATT_TX", op.label + " (" + op.writePayload.length + "B): "
+                        + Bvm02Protocol.bytesToHex(op.writePayload) + " -> @bvm02_ble");
+                activeBridgeSession.sendLine("WRITE_CHAR " + u4 + " " + hex);
+            }
+            mainHandler.removeCallbacks(opWatchdogRunnable);
+            mainHandler.postDelayed(opWatchdogRunnable, GATT_OP_TIMEOUT_MS);
+            return;
+        }
+
         BluetoothGattCharacteristic ch = activeServiceFff0.getCharacteristic(op.charUuid);
         if (ch == null) {
             pumpNextOp();
@@ -1297,6 +1680,71 @@ public final class BleClient {
         byte[] slice = new byte[cap];
         System.arraycopy(rec, 0, slice, 0, cap);
         return Bvm02Protocol.bytesToHex(slice) + (end > cap ? " ..." : "");
+    }
+
+    public static Map<UUID, Integer> parseGattReadySpecs(String specCsv) {
+        Map<UUID, Integer> map = new LinkedHashMap<UUID, Integer>();
+        if (specCsv == null || specCsv.isEmpty() || "none".equals(specCsv)) {
+            return map;
+        }
+        String[] entries = specCsv.split(",");
+        for (int i = 0; i < entries.length; i++) {
+            String item = entries[i].trim();
+            int colon = item.indexOf(':');
+            if (colon <= 0) continue;
+            UUID u = expandShortUuid(item.substring(0, colon));
+            if (u == null) continue;
+            int props = 0;
+            try {
+                props = Integer.parseInt(item.substring(colon + 1), 16);
+            } catch (NumberFormatException ignored) {}
+            map.put(u, Integer.valueOf(props));
+        }
+        return map;
+    }
+
+    public static UUID expandShortUuid(String raw) {
+        if (raw == null) return null;
+        String s = raw.trim().toLowerCase(Locale.US);
+        if (s.startsWith("0x")) {
+            s = s.substring(2);
+        }
+        try {
+            if (s.length() == 4) {
+                return UUID.fromString("0000" + s + "-0000-1000-8000-00805f9b34fb");
+            }
+            if (s.length() == 36) {
+                return UUID.fromString(s);
+            }
+        } catch (IllegalArgumentException ignored) {}
+        return null;
+    }
+
+    public static String shortHexUuid(UUID u) {
+        if (u == null) return "0000";
+        String s = u.toString().toLowerCase(Locale.US);
+        if (s.startsWith("0000") && s.endsWith("-0000-1000-8000-00805f9b34fb") && s.length() == 36) {
+            return s.substring(4, 8);
+        }
+        return s;
+    }
+
+    public static byte[] decodeHexOrEmpty(String token) {
+        if (token == null) return new byte[0];
+        String s = token.trim().replace(" ", "");
+        if (s.isEmpty() || "-".equals(s) || (s.length() & 1) != 0) {
+            return new byte[0];
+        }
+        int n = s.length() / 2;
+        byte[] out = new byte[n];
+        try {
+            for (int i = 0; i < n; i++) {
+                out[i] = (byte) Integer.parseInt(s.substring(i * 2, i * 2 + 2), 16);
+            }
+            return out;
+        } catch (NumberFormatException ignored) {
+            return new byte[0];
+        }
     }
 
     private static String shortUuid(UUID u) {

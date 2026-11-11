@@ -78,7 +78,7 @@ public final class BtMemInspector {
 
     public static List<String> inspectLiveCapabilities(ModContext mod) {
         List<String> out = new ArrayList<String>();
-        out.add("hook_version=0.1.6 process=com.android.bluetooth pid="
+        out.add("hook_version=0.2.0 process=com.android.bluetooth pid="
                 + android.os.Process.myPid() + " uid=" + android.os.Process.myUid()
                 + " mod_enabled=" + (mod == null || mod.enabled()));
 

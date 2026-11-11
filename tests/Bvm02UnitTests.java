@@ -1,3 +1,4 @@
+import bvm02.app.BroadcomGattEnabler;
 import bvm02.app.BtStackProbe;
 import bvm02.app.Bvm02Protocol;
 import bvm02.app.ScreenshotHelper;
@@ -8,12 +9,15 @@ import java.io.File;
 import java.io.FileInputStream;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Host JVM unit test suite for BVM02 protocol framing, BLE scanRecord parsing,
  * 20-byte ATT multi-chunk reassembly, 12V/24V SoC curves, MAC validation, Telechips BGRA fix,
- * and in-RAM Dalvik DEX / ODEX class & method introspection.
+ * Broadcom RadioManager dynamic Proxy safety, and in-RAM Dalvik DEX / ODEX introspection.
  */
 public final class Bvm02UnitTests {
 
@@ -50,6 +54,7 @@ public final class Bvm02UnitTests {
         testPiecewiseSocAndHealthCurve();
         testSensorConfigValidation();
         testTelechipsBgraSwapDetector();
+        testBroadcomProxyAndMacRedaction();
         testInRamDexInventoryParser(args.length > 0 ? args[0] : "build/dex/classes.dex");
 
         System.out.println("  [OK] Bvm02UnitTests passed all " + passed + " assertions.");
@@ -309,17 +314,27 @@ public final class Bvm02UnitTests {
         byte[] dexBytes = bos.toByteArray();
 
         List<BtStackProbe.DexClassEntry> classes = BtStackProbe.extractDexInventory(dexBytes);
-        assertTrue("extracted >= 8 app classes from classes.dex", classes.size() >= 8);
+        assertTrue("extracted >= 9 app classes from classes.dex", classes.size() >= 9);
 
         BtStackProbe.DexClassEntry protoCls = null;
         BtStackProbe.DexClassEntry probeCls = null;
+        BtStackProbe.DexClassEntry enablerCls = null;
         for (int i = 0; i < classes.size(); i++) {
             BtStackProbe.DexClassEntry ce = classes.get(i);
             if ("bvm02.app.Bvm02Protocol".equals(ce.className)) protoCls = ce;
             if ("bvm02.app.BtStackProbe".equals(ce.className)) probeCls = ce;
+            if ("bvm02.app.BroadcomGattEnabler".equals(ce.className)) enablerCls = ce;
         }
         assertTrue("found Bvm02Protocol in DEX inventory", protoCls != null);
         assertTrue("found BtStackProbe in DEX inventory", probeCls != null);
+        assertTrue("found BroadcomGattEnabler in DEX inventory", enablerCls != null);
+        assertTrue("BroadcomGattEnabler instanceFields decoded", !enablerCls.instanceFields.isEmpty());
+
+        // Verify filtered DEX extraction (used on large system JARs/ODEXes like services.jar)
+        List<BtStackProbe.DexClassEntry> filtered = BtStackProbe.extractDexInventory(
+                dexBytes, new String[]{"broadcomgattenabler"});
+        assertTrue("filtered DEX inventory returns only BroadcomGattEnabler classes",
+                !filtered.isEmpty() && filtered.size() < classes.size());
 
         boolean foundParseVolt = false;
         for (int i = 0; i < protoCls.declaredMethods.size(); i++) {
@@ -351,5 +366,51 @@ public final class Bvm02UnitTests {
 
         // Malformed / truncated buffers return empty list safely
         assertEquals("reject short buffer", 0, BtStackProbe.extractDexInventory(new byte[10]).size());
+    }
+
+    public interface MockRadioCallback {
+        void onRadioStateChange(boolean enabled);
+        boolean checkFlag();
+        int getCode();
+    }
+
+    private static void testBroadcomProxyAndMacRedaction() {
+        // 1. Verify MAC redaction for both colon-delimited and contiguous 12-hex btaddr properties
+        assertEqualsStr("redact colon MAC",
+                "Adapter [00:92:A5:**:**:**]",
+                BtStackProbe.redactMacOctets("Adapter [00:92:A5:27:B2:F4]"));
+        assertEqualsStr("redact ro.btaddr 12-hex",
+                "[ro.btaddr]: [C8D9D2******]",
+                BtStackProbe.redactMacOctets("[ro.btaddr]: [C8D9D2139CD7]"));
+        assertEqualsStr("preserve non-addr build host",
+                "[ro.build.host]: [cbcd-deploy-050709073412]",
+                BtStackProbe.redactMacOctets("[ro.build.host]: [cbcd-deploy-050709073412]"));
+
+        // 2. Verify BroadcomGattEnabler dynamic Proxy Object identity semantics in ArrayList & HashMap
+        ClassLoader cl = Bvm02UnitTests.class.getClassLoader();
+        MockRadioCallback p1 = (MockRadioCallback) BroadcomGattEnabler.createDetachedCallbackProxy(
+                cl, MockRadioCallback.class, "TestRadioCb");
+        MockRadioCallback p2 = (MockRadioCallback) BroadcomGattEnabler.createDetachedCallbackProxy(
+                cl, MockRadioCallback.class, "TestRadioCb");
+
+        assertTrue("proxy equals self", p1.equals(p1));
+        assertTrue("proxy not equal to distinct proxy", !p1.equals(p2));
+        assertTrue("proxy not equal to null", !p1.equals(null));
+        assertTrue("proxy toString contains label", p1.toString().startsWith("TestRadioCb@"));
+
+        List<MockRadioCallback> list = new ArrayList<MockRadioCallback>();
+        list.add(p1);
+        assertTrue("ArrayList contains p1", list.contains(p1));
+        assertTrue("ArrayList does not contain p2", !list.contains(p2));
+
+        Map<MockRadioCallback, String> map = new HashMap<MockRadioCallback, String>();
+        map.put(p1, "BLE");
+        assertEqualsStr("HashMap lookup p1", "BLE", map.get(p1));
+        assertTrue("HashMap lookup p2 is null", map.get(p2) == null);
+
+        // Primitive return safety (never throws NullPointerException on unboxing)
+        p1.onRadioStateChange(true);
+        assertTrue("primitive boolean default false", !p1.checkFlag());
+        assertEquals("primitive int default 0", 0, p1.getCode());
     }
 }

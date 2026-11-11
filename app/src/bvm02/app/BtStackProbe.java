@@ -3,10 +3,12 @@ package bvm02.app;
 import android.bluetooth.BluetoothAdapter;
 import android.bluetooth.BluetoothDevice;
 import android.bluetooth.BluetoothGatt;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.pm.PackageInfo;
 import android.content.pm.PackageManager;
 import android.content.pm.ServiceInfo;
+import android.content.res.Resources;
 import android.os.IBinder;
 
 import java.io.BufferedReader;
@@ -35,21 +37,22 @@ import java.util.zip.ZipFile;
 /**
  * Non-invasive, strictly read-only, in-RAM Gen5W Bluetooth & Broadcom BLE stack introspector.
  *
- * Gen5W head units (Android 4.4.2, API 19) ship Broadcom's proprietary Bluetooth framework
- * (/system/framework/com.broadcom.bt.jar) alongside or in place of stock AOSP Bluedroid GATT.
- * When BluetoothAdapter.startLeScan() returns false, this probe inspects:
- *   1. BluetoothAdapter internal mManagerService -> getBluetoothGatt() (IBluetoothGatt) & mService (IBluetooth)
- *   2. Runtime declared methods on BluetoothAdapter, BluetoothDevice, IBluetooth, and IBluetoothGatt
- *   3. System shared libraries, Binder services (ServiceManager), and installed Bluetooth packages/services
- *   4. Complete in-RAM DEX class & method inventory of /system/framework/com.broadcom.bt.jar (and .odex)
- *   5. Read-only /system/etc/bluetooth configs, /system/bin & /system/lib BT binaries, and non-PII BT props
+ * Upgraded in v0.1.2 based on Ioniq 5 Gen5W (v0.1.1) telemetry:
+ *  1. Adapter internal mManagerService (IBluetoothManager), getBluetoothGatt(), and mService (IBluetooth)
+ *  2. System shared libraries & Bluetooth Binder services
+ *  3. Installed BT packages including PackageManager.GET_DISABLED_COMPONENTS & GattService component state
+ *  4. /system/app/Bluetooth.apk boolean config table (profile_supported_gatt, etc.) & DEX/ODEX inventory
+ *  5. Targeted DEX/ODEX inspection of BluetoothManagerService (/system/framework/services.jar/.odex)
+ *     and Broadcom GATT/RadioManager (/system/framework/com.broadcom.bt.jar) without dumping unrelated profiles
+ *  6. Live read-only Broadcom BluetoothRadioManager constant & readiness inspection
+ *  7. Read-only /system/etc/bluetooth configs, native BT libs, processes, and redacted BT properties
  *
  * Zero root required, zero writes to internal /data eMMC flash, and zero PII/VIN/serial collection.
  */
 public final class BtStackProbe {
 
     private static final Charset UTF8 = Charset.forName("UTF-8");
-    private static final int MAX_DEX_BYTES = 8 * 1024 * 1024;
+    private static final int MAX_DEX_BYTES = 16 * 1024 * 1024;
     private static final AtomicBoolean PROBE_RUNNING = new AtomicBoolean(false);
 
     public static final class DexClassEntry {
@@ -57,19 +60,72 @@ public final class BtStackProbe {
         public final String superName;
         public final int accessFlags;
         public final List<String> staticFields;
+        public final List<String> instanceFields;
         public final List<String> declaredMethods;
 
         public DexClassEntry(String className, String superName, int accessFlags,
                              List<String> staticFields, List<String> declaredMethods) {
+            this(className, superName, accessFlags, staticFields,
+                    Collections.<String>emptyList(), declaredMethods);
+        }
+
+        public DexClassEntry(String className, String superName, int accessFlags,
+                             List<String> staticFields, List<String> instanceFields,
+                             List<String> declaredMethods) {
             this.className = className;
             this.superName = superName;
             this.accessFlags = accessFlags;
             this.staticFields = staticFields;
+            this.instanceFields = instanceFields;
             this.declaredMethods = declaredMethods;
         }
     }
 
     private BtStackProbe() {}
+
+    /**
+     * Reflectively extracts BluetoothAdapter.mManagerService (android.bluetooth.IBluetoothManager).
+     */
+    public static Object getIBluetoothManager(BluetoothAdapter adapter) {
+        if (adapter == null) return null;
+        try {
+            Field fMgr = BluetoothAdapter.class.getDeclaredField("mManagerService");
+            fMgr.setAccessible(true);
+            return fMgr.get(adapter);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    /**
+     * Reflectively extracts BluetoothAdapter.mService (android.bluetooth.IBluetooth).
+     */
+    public static Object getIBluetoothService(BluetoothAdapter adapter) {
+        if (adapter == null) return null;
+        try {
+            Field fSvc = BluetoothAdapter.class.getDeclaredField("mService");
+            fSvc.setAccessible(true);
+            return fSvc.get(adapter);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
+
+    /**
+     * Reflectively queries BluetoothAdapter.mManagerService.getBluetoothGatt().
+     * Returns non-null IBluetoothGatt proxy when GattService is active, or null otherwise.
+     */
+    public static Object getLiveIBluetoothGatt(BluetoothAdapter adapter) {
+        Object mgr = getIBluetoothManager(adapter);
+        if (mgr == null) return null;
+        try {
+            Method mGetGatt = mgr.getClass().getMethod("getBluetoothGatt");
+            mGetGatt.setAccessible(true);
+            return mGetGatt.invoke(mgr);
+        } catch (Throwable ignored) {
+            return null;
+        }
+    }
 
     /**
      * Quick synchronous 1-line check of AOSP IBluetoothGatt & IBluetooth binder handles inside BluetoothAdapter.
@@ -78,11 +134,9 @@ public final class BtStackProbe {
         if (adapter == null) {
             return "adapter=null";
         }
-        StringBuilder sb = new StringBuilder(160);
+        StringBuilder sb = new StringBuilder(180);
         try {
-            Field fMgr = BluetoothAdapter.class.getDeclaredField("mManagerService");
-            fMgr.setAccessible(true);
-            Object mgr = fMgr.get(adapter);
+            Object mgr = getIBluetoothManager(adapter);
             if (mgr == null) {
                 sb.append("mManagerService=NULL");
             } else {
@@ -108,9 +162,7 @@ public final class BtStackProbe {
         }
 
         try {
-            Field fSvc = BluetoothAdapter.class.getDeclaredField("mService");
-            fSvc.setAccessible(true);
-            Object svc = fSvc.get(adapter);
+            Object svc = getIBluetoothService(adapter);
             sb.append(" | mService=").append(svc == null ? "NULL" : describeBinderOwner(svc));
         } catch (Throwable ignored) {}
 
@@ -141,7 +193,7 @@ public final class BtStackProbe {
     }
 
     /**
-     * Reflectively queries Broadcom BleAdapter.getDeviceType(BluetoothDevice) if com.broadcom.bt is loaded.
+     * Reflectively queries Broadcom BleAdapter.getDeviceType(BluetoothDevice) if present.
      * Returns -1 when unavailable.
      */
     public static int tryGetBroadcomDeviceType(BluetoothDevice device) {
@@ -167,7 +219,7 @@ public final class BtStackProbe {
     }
 
     /**
-     * Runs the full read-only Gen5W Bluetooth & DEX stack probe on a background thread.
+     * Runs the targeted read-only Gen5W Bluetooth & DEX stack probe on a background thread.
      */
     public static void runAsyncProbe(final Context context, final Runnable onCompleteCallback) {
         if (context == null) return;
@@ -196,7 +248,7 @@ public final class BtStackProbe {
     }
 
     private static void runProbeInternal(Context ctx) {
-        DiagLogger.log("BT_PROBE", "=== BEGIN GEN5W BLUETOOTH & BLE STACK PROBE (v0.1.1) ===");
+        DiagLogger.log("BT_PROBE", "=== BEGIN GEN5W BLUETOOTH & BLE STACK PROBE (v0.1.2) ===");
 
         BluetoothAdapter adapter = null;
         try {
@@ -205,67 +257,47 @@ public final class BtStackProbe {
             DiagLogger.log("BT_PROBE", "getDefaultAdapter threw: " + t);
         }
 
-        // 1. Adapter internal binder handles & AIDL interface methods
-        DiagLogger.log("BT_PROBE", "[1/6] Adapter Binder Handles: " + checkIBluetoothGattStatus(adapter));
+        // 1. Adapter internal binder handles & key AIDL methods
+        DiagLogger.log("BT_PROBE", "[1/7] Adapter Binder Handles: " + checkIBluetoothGattStatus(adapter));
         probeAdapterAndAidlInterfaces(adapter);
 
         // 2. System shared libraries & Binder ServiceManager inventory
         probeSharedLibrariesAndBinderServices(ctx);
 
-        // 3. Installed Bluetooth / Broadcom / Projection packages & <service> declarations
+        // 3. Installed Bluetooth packages (including GET_DISABLED_COMPONENTS!) & GattService state
         probeInstalledBtPackages(ctx);
 
-        // 4. /system/framework Bluetooth JAR / ODEX in-RAM DEX extraction (e.g. com.broadcom.bt.jar)
-        probeFrameworkBtJars();
+        // 4. /system/app/Bluetooth.apk boolean config table (profile_supported_*) & DEX/ODEX inventory
+        probeBluetoothApkResourcesAndDex(ctx);
 
-        // 5. Runtime ClassLoader reflection check on candidate Broadcom / BLE classes
-        probeCandidateClassesInClassLoader(ctx.getClassLoader());
+        // 5. Targeted /system/framework DEX/ODEX inspection: com.broadcom.bt.jar + services.jar (BluetoothManagerService)
+        probeFrameworkBtAndServicesDex();
 
-        // 6. Read-only /system/etc/bluetooth configs, native libs/daemons, ps & non-PII BT properties
+        // 6. Live read-only Broadcom RadioManager & ClassLoader link check
+        probeBroadcomRadioManagerReadOnly(ctx.getClassLoader());
+
+        // 7. Read-only /system/etc/bluetooth configs, native libs, redacted BT props & processes
         probeSystemFilesAndDaemons();
 
-        DiagLogger.log("BT_PROBE", "=== END GEN5W BLUETOOTH & BLE STACK PROBE ===");
+        DiagLogger.log("BT_PROBE", "=== END GEN5W BLUETOOTH & BLE STACK PROBE (v0.1.2) ===");
     }
 
     private static void probeAdapterAndAidlInterfaces(BluetoothAdapter adapter) {
-        // Log non-standard or BLE/GATT/Discovery-related methods on BluetoothAdapter & BluetoothDevice
-        dumpFilteredClassMethods("BluetoothAdapter", BluetoothAdapter.class,
-                new String[]{"le", "gatt", "scan", "discov", "brcm", "broadcom", "proxy", "profile", "uuid", "ble"});
-        dumpFilteredClassMethods("BluetoothDevice", BluetoothDevice.class,
-                new String[]{"le", "gatt", "type", "connect", "uuid", "brcm", "broadcom", "ble", "sdp"});
-
         if (adapter == null) return;
-
-        // Dump all methods on IBluetoothManager, IBluetooth, and IBluetoothGatt AIDL interfaces
-        try {
-            Field fMgr = BluetoothAdapter.class.getDeclaredField("mManagerService");
-            fMgr.setAccessible(true);
-            Object mgr = fMgr.get(adapter);
-            if (mgr != null) {
-                dumpInterfaceMethods("IBluetoothManager", mgr.getClass());
-                try {
-                    Method mGetGatt = mgr.getClass().getMethod("getBluetoothGatt");
-                    mGetGatt.setAccessible(true);
-                    Object gattObj = mGetGatt.invoke(mgr);
-                    if (gattObj != null) {
-                        dumpInterfaceMethods("IBluetoothGatt(live)", gattObj.getClass());
-                    }
-                } catch (Throwable ignored) {}
-            }
-        } catch (Throwable ignored) {}
-
-        try {
-            Class<?> iBtGattCls = Class.forName("android.bluetooth.IBluetoothGatt");
-            dumpAllDeclaredMethods("IBluetoothGatt(AIDL)", iBtGattCls);
-        } catch (Throwable t) {
-            DiagLogger.log("BT_PROBE", "Class android.bluetooth.IBluetoothGatt not found: " + t.getMessage());
+        Object mgr = getIBluetoothManager(adapter);
+        if (mgr != null) {
+            dumpInterfaceMethods("IBluetoothManager", mgr.getClass());
+            try {
+                Method mRadio = mgr.getClass().getMethod("isRadioEnabled");
+                Object rVal = mRadio.invoke(mgr);
+                DiagLogger.log("BT_PROBE", "  IBluetoothManager.isRadioEnabled() -> " + rVal);
+            } catch (Throwable ignored) {}
         }
 
-        try {
-            Class<?> iBtCls = Class.forName("android.bluetooth.IBluetooth");
-            dumpFilteredClassMethods("IBluetooth(AIDL)", iBtCls,
-                    new String[]{"le", "gatt", "scan", "discov", "brcm", "broadcom", "type", "uuid", "ble", "remote"});
-        } catch (Throwable ignored) {}
+        Object liveGatt = getLiveIBluetoothGatt(adapter);
+        if (liveGatt != null) {
+            DiagLogger.log("BT_PROBE", "  Live IBluetoothGatt binder present: " + describeBinderOwner(liveGatt));
+        }
     }
 
     private static void probeSharedLibrariesAndBinderServices(Context ctx) {
@@ -279,7 +311,7 @@ public final class BtStackProbe {
                     if (i > 0) sb.append(", ");
                     sb.append(libs[i]);
                 }
-                DiagLogger.log("BT_PROBE", "[2/6] System Shared Libraries (" + libs.length + "): " + sb);
+                DiagLogger.log("BT_PROBE", "[2/7] System Shared Libraries (" + libs.length + "): " + sb);
             }
         } catch (Throwable t) {
             DiagLogger.log("BT_PROBE", "getSystemSharedLibraryNames err: " + t.getMessage());
@@ -292,17 +324,12 @@ public final class BtStackProbe {
             String[] services = (String[]) mList.invoke(null);
             if (services != null) {
                 Arrays.sort(services);
-                List<String> matched = new ArrayList<String>();
-                StringBuilder allNames = new StringBuilder();
                 for (int i = 0; i < services.length; i++) {
                     String s = services[i];
                     if (s == null) continue;
-                    if (allNames.length() > 0) allNames.append(", ");
-                    allNames.append(s);
                     String low = s.toLowerCase(Locale.US);
                     if (containsAny(low, new String[]{
-                            "bt", "blue", "gatt", "brcm", "broadcom", "bsa", "ble",
-                            "wireless", "daudio", "mobis", "hkmc", "dipo", "car"
+                            "bt", "blue", "gatt", "brcm", "broadcom", "bsa", "ble", "dipo"
                     })) {
                         String desc = "?";
                         try {
@@ -317,12 +344,8 @@ public final class BtStackProbe {
                         } catch (Throwable bt) {
                             desc = "err:" + bt.getClass().getSimpleName();
                         }
-                        matched.add(s + " -> " + desc);
+                        DiagLogger.log("BT_PROBE", "  Binder: " + s + " -> " + desc);
                     }
-                }
-                DiagLogger.log("BT_PROBE", "Binder Services (" + services.length + " total): " + allNames);
-                for (int i = 0; i < matched.size(); i++) {
-                    DiagLogger.log("BT_PROBE", "  Binder[" + i + "]: " + matched.get(i));
                 }
             }
         } catch (Throwable t) {
@@ -333,29 +356,17 @@ public final class BtStackProbe {
     private static void probeInstalledBtPackages(Context ctx) {
         try {
             PackageManager pm = ctx.getPackageManager();
-            List<PackageInfo> pkgs = pm.getInstalledPackages(PackageManager.GET_SERVICES);
+            int flags = PackageManager.GET_SERVICES | PackageManager.GET_DISABLED_COMPONENTS;
+            List<PackageInfo> pkgs = pm.getInstalledPackages(flags);
             if (pkgs == null) return;
-            DiagLogger.log("BT_PROBE", "[3/6] Scanning " + pkgs.size() + " installed packages for BT/BLE components...");
+            DiagLogger.log("BT_PROBE", "[3/7] Installed BT packages (with GET_DISABLED_COMPONENTS):");
             for (int i = 0; i < pkgs.size(); i++) {
                 PackageInfo pi = pkgs.get(i);
                 if (pi == null || pi.packageName == null) continue;
                 String low = pi.packageName.toLowerCase(Locale.US);
-                boolean relevant = containsAny(low, new String[]{
-                        "bluetooth", "broadcom", "brcm", "bsa", "gatt", "bt", "dipo"
-                });
-                if (!relevant && pi.services != null) {
-                    for (int s = 0; s < pi.services.length; s++) {
-                        ServiceInfo si = pi.services[s];
-                        if (si != null && si.name != null) {
-                            String slow = si.name.toLowerCase(Locale.US);
-                            if (containsAny(slow, new String[]{"bluetooth", "broadcom", "gatt", "ble", "btcm"})) {
-                                relevant = true;
-                                break;
-                            }
-                        }
-                    }
+                if (!containsAny(low, new String[]{"bluetooth", "broadcom", "brcm", "bsa", "gatt", "btsettings"})) {
+                    continue;
                 }
-                if (!relevant) continue;
 
                 boolean pkgEnabled = pi.applicationInfo != null && pi.applicationInfo.enabled;
                 String srcDir = pi.applicationInfo != null ? String.valueOf(pi.applicationInfo.sourceDir) : "?";
@@ -365,187 +376,149 @@ public final class BtStackProbe {
                         ServiceInfo si = pi.services[s];
                         if (si == null) continue;
                         if (svcSb.length() > 0) svcSb.append(", ");
-                        svcSb.append(si.name).append(si.enabled ? "" : "(DISABLED)");
+                        svcSb.append(si.name).append(si.enabled ? "" : "(MANIFEST_DISABLED)");
                     }
                 }
                 DiagLogger.log("BT_PROBE", "  Pkg: " + pi.packageName
                         + " (enabled=" + pkgEnabled + ", apk=" + srcDir + ")"
-                        + (svcSb.length() > 0 ? (" services=[" + svcSb + "]") : ""));
+                        + (svcSb.length() > 0 ? (" services=[" + svcSb + "]") : " services=[]"));
+            }
+
+            // Explicitly query ComponentEnabledSetting for GattService candidates
+            String[] gattCandidates = {
+                "com.android.bluetooth.gatt.GattService",
+                "com.broadcom.bt.service.gatt.GattService"
+            };
+            for (int i = 0; i < gattCandidates.length; i++) {
+                try {
+                    ComponentName cn = new ComponentName("com.android.bluetooth", gattCandidates[i]);
+                    int state = pm.getComponentEnabledSetting(cn);
+                    DiagLogger.log("BT_PROBE", "  ComponentEnabledSetting(" + cn.flattenToShortString()
+                            + ") = " + state + " (0=DEFAULT, 1=ENABLED, 2=DISABLED)");
+                } catch (Throwable t) {
+                    DiagLogger.log("BT_PROBE", "  ComponentEnabledSetting(" + gattCandidates[i]
+                            + ") threw: " + t.getClass().getSimpleName() + ": " + t.getMessage());
+                }
             }
         } catch (Throwable t) {
             DiagLogger.log("BT_PROBE", "Installed BT package scan err: " + t.getMessage());
         }
     }
 
-    private static void probeFrameworkBtJars() {
-        File fwDir = new File("/system/framework");
-        File[] files = fwDir.listFiles();
-        if (files == null) {
-            DiagLogger.log("BT_PROBE", "[4/6] /system/framework listFiles returned null");
-            return;
-        }
-        Arrays.sort(files, new Comparator<File>() {
-            @Override
-            public int compare(File a, File b) {
-                return a.getName().compareTo(b.getName());
-            }
-        });
-
-        List<File> btFiles = new ArrayList<File>();
-        for (int i = 0; i < files.length; i++) {
-            File f = files[i];
-            String low = f.getName().toLowerCase(Locale.US);
-            if (containsAny(low, new String[]{"broadcom", "brcm", "bt", "blue", "bsa", "gatt"})) {
-                btFiles.add(f);
-            }
-        }
-
-        DiagLogger.log("BT_PROBE", "[4/6] /system/framework BT-related files (" + btFiles.size() + "):");
-        for (int i = 0; i < btFiles.size(); i++) {
-            File f = btFiles.get(i);
-            DiagLogger.log("BT_PROBE", "  Framework file: " + f.getAbsolutePath()
-                    + " (" + f.length() + " bytes, canRead=" + f.canRead() + ")");
-        }
-
-        for (int i = 0; i < btFiles.size(); i++) {
-            File f = btFiles.get(i);
-            if (!f.isFile() || !f.canRead() || f.length() <= 0 || f.length() > MAX_DEX_BYTES) continue;
-            String nameLow = f.getName().toLowerCase(Locale.US);
-            if (nameLow.endsWith(".jar") || nameLow.endsWith(".apk")) {
-                inspectJarOrApkDex(f);
-            } else if (nameLow.endsWith(".odex")) {
-                // Only parse standalone .odex if we didn't already get classes.dex from its .jar
-                String jarPartnerName = f.getName().substring(0, f.getName().length() - 5) + ".jar";
-                File jarPartner = new File(f.getParentFile(), jarPartnerName);
-                if (!jarHasClassesDex(jarPartner)) {
-                    inspectRawDexOrOdexFile(f);
-                }
-            }
-        }
-    }
-
-    private static boolean jarHasClassesDex(File jarFile) {
-        if (jarFile == null || !jarFile.isFile() || !jarFile.canRead()) return false;
-        ZipFile zf = null;
+    private static void probeBluetoothApkResourcesAndDex(Context ctx) {
+        DiagLogger.log("BT_PROBE", "[4/7] Inspecting com.android.bluetooth resources & DEX/ODEX:");
+        String btApkPath = "/system/app/Bluetooth.apk";
         try {
-            zf = new ZipFile(jarFile);
-            return zf.getEntry("classes.dex") != null;
-        } catch (Throwable ignored) {
-            return false;
-        } finally {
-            if (zf != null) {
-                try { zf.close(); } catch (Throwable ignored) {}
+            PackageInfo pi = ctx.getPackageManager().getPackageInfo("com.android.bluetooth", 0);
+            if (pi != null && pi.applicationInfo != null && pi.applicationInfo.sourceDir != null) {
+                btApkPath = pi.applicationInfo.sourceDir;
             }
-        }
-    }
+        } catch (Throwable ignored) {}
 
-    private static void inspectJarOrApkDex(File jarFile) {
-        ZipFile zf = null;
+        // 4A. Read all <bool> config entries from com.android.bluetooth (e.g. profile_supported_gatt)
         try {
-            zf = new ZipFile(jarFile);
-            ZipEntry dexEntry = zf.getEntry("classes.dex");
-            if (dexEntry == null) {
-                StringBuilder entries = new StringBuilder();
-                Enumeration<? extends ZipEntry> en = zf.entries();
-                while (en.hasMoreElements()) {
-                    ZipEntry ze = en.nextElement();
-                    if (entries.length() > 0) entries.append(", ");
-                    entries.append(ze.getName()).append('(').append(ze.getSize()).append(')');
+            Context btCtx = ctx.createPackageContext("com.android.bluetooth", 0);
+            Resources res = btCtx.getResources();
+            StringBuilder boolSb = new StringBuilder();
+            int foundCount = 0;
+
+            for (int typeIdx = 1; typeIdx <= 16; typeIdx++) {
+                int probeId = 0x7f000000 | (typeIdx << 16);
+                String typeName;
+                try {
+                    typeName = res.getResourceTypeName(probeId);
+                } catch (Throwable ignored) {
+                    continue;
                 }
-                DiagLogger.log("BT_DEX", jarFile.getName() + " has no classes.dex (entries: " + entries + ")");
-                // Check arm/odex fallback if present
-                File armOdex = new File(new File(jarFile.getParentFile(), "arm"),
-                        jarFile.getName().replace(".jar", ".odex").replace(".apk", ".odex"));
-                if (armOdex.isFile() && armOdex.canRead()) {
-                    inspectRawDexOrOdexFile(armOdex);
+                if (!"bool".equals(typeName)) continue;
+
+                for (int entryIdx = 0; entryIdx < 96; entryIdx++) {
+                    int id = probeId | entryIdx;
+                    try {
+                        String entryName = res.getResourceEntryName(id);
+                        boolean val = res.getBoolean(id);
+                        if (boolSb.length() > 0) boolSb.append(", ");
+                        boolSb.append(entryName).append('=').append(val);
+                        foundCount++;
+                    } catch (Throwable endOfEntries) {
+                        break;
+                    }
                 }
-                return;
+                break;
             }
-            if (dexEntry.getSize() > MAX_DEX_BYTES) {
-                DiagLogger.log("BT_DEX", jarFile.getName() + " classes.dex too large (" + dexEntry.getSize() + "B); skipping");
-                return;
+
+            if (foundCount > 0) {
+                DiagLogger.log("BT_PROBE", "  Bluetooth.apk <bool> configs (" + foundCount + "): " + boolSb);
+            } else {
+                // Fallback direct identifier lookup
+                String[] keys = {
+                    "profile_supported_gatt", "profile_supported_bt_le", "profile_supported_a2dp",
+                    "profile_supported_hs_hfp", "profile_supported_hid", "profile_supported_map"
+                };
+                for (int i = 0; i < keys.length; i++) {
+                    int id = res.getIdentifier(keys[i], "bool", "com.android.bluetooth");
+                    if (id != 0) {
+                        DiagLogger.log("BT_PROBE", "  Bluetooth.apk bool " + keys[i] + "=" + res.getBoolean(id));
+                    } else {
+                        DiagLogger.log("BT_PROBE", "  Bluetooth.apk bool " + keys[i] + "=<not defined>");
+                    }
+                }
             }
-            byte[] dexBytes = readStreamBounded(zf.getInputStream(dexEntry), MAX_DEX_BYTES);
-            logDexInventory(jarFile.getName(), dexBytes);
         } catch (Throwable t) {
-            DiagLogger.log("BT_DEX", "Error reading " + jarFile.getName() + ": " + t);
-        } finally {
-            if (zf != null) {
-                try { zf.close(); } catch (Throwable ignored) {}
-            }
+            DiagLogger.log("BT_PROBE", "  Bluetooth.apk resource read err: " + t);
+        }
+
+        // 4B. Inspect /system/app/Bluetooth.apk (or Bluetooth.odex) in RAM
+        File apkFile = new File(btApkPath);
+        byte[] btDex = loadDexOrOdexBytes(apkFile);
+        if (btDex != null) {
+            logTargetedDexInventory(apkFile.getName(), btDex, null,
+                    new String[]{"gatt", "adapterservice", "btservice.config", "btservice.profile", "radiomanager", "blescan"},
+                    true);
+            logMatchingDexStrings(apkFile.getName(), btDex,
+                    new String[]{"gatt", "radiomanager", "profile_supported", "ibluetoothgatt", "blescan"});
+        } else {
+            DiagLogger.log("BT_DEX", "  Could not read DEX/ODEX for " + btApkPath);
         }
     }
 
-    private static void inspectRawDexOrOdexFile(File file) {
-        FileInputStream fis = null;
-        try {
-            fis = new FileInputStream(file);
-            byte[] raw = readStreamBounded(fis, MAX_DEX_BYTES);
-            logDexInventory(file.getName(), raw);
-        } catch (Throwable t) {
-            DiagLogger.log("BT_DEX", "Error reading " + file.getName() + ": " + t);
-        } finally {
-            if (fis != null) {
-                try { fis.close(); } catch (Throwable ignored) {}
-            }
+    private static void probeFrameworkBtAndServicesDex() {
+        DiagLogger.log("BT_PROBE", "[5/7] Targeted /system/framework DEX/ODEX inspection:");
+
+        // 5A. com.broadcom.bt.jar -> ONLY dump gatt & radiomanager classes in detail (zero AVRCP/MAP/PBAP noise)
+        File brcmJar = new File("/system/framework/com.broadcom.bt.jar");
+        byte[] brcmDex = loadDexOrOdexBytes(brcmJar);
+        if (brcmDex != null) {
+            logTargetedDexInventory("com.broadcom.bt.jar", brcmDex,
+                    new String[]{"com.broadcom.bt.gatt.", "com.broadcom.bt.service.radiomanager."},
+                    new String[]{"com.broadcom.bt.gatt.", "com.broadcom.bt.service.radiomanager."},
+                    false);
+        }
+
+        // 5B. /system/framework/services.jar (or services.odex) -> ONLY BluetoothManagerService & BT/GATT classes!
+        File servicesJar = new File("/system/framework/services.jar");
+        byte[] servicesDex = loadDexOrOdexBytes(servicesJar);
+        if (servicesDex != null) {
+            logTargetedDexInventory("services.jar", servicesDex,
+                    new String[]{"bluetooth", "gatt", "radiomanager"},
+                    new String[]{"bluetoothmanagerservice", "gatt", "radiomanager"},
+                    true);
+            logMatchingDexStrings("services.jar", servicesDex,
+                    new String[]{"gattservice", "enablegatt", "enableradio", "ibluetoothgatt", "bluetooth.gatt", "radiomgr"});
+        } else {
+            DiagLogger.log("BT_DEX", "  Could not read /system/framework/services.jar (.odex) within RAM cap");
         }
     }
 
-    private static void logDexInventory(String sourceName, byte[] rawBytes) {
-        List<DexClassEntry> classes = extractDexInventory(rawBytes);
-        DiagLogger.log("BT_DEX", "Parsed " + sourceName + " (" + rawBytes.length + "B) -> "
-                + classes.size() + " class(es):");
-        if (classes.isEmpty()) return;
-
-        int totalMethods = 0;
-        StringBuilder classSummary = new StringBuilder();
-        for (int i = 0; i < classes.size(); i++) {
-            DexClassEntry ce = classes.get(i);
-            totalMethods += ce.declaredMethods.size();
-            if (classSummary.length() > 0) classSummary.append(", ");
-            classSummary.append(ce.className);
-            if (classSummary.length() >= 480) {
-                DiagLogger.log("BT_DEX", "  Classes: " + classSummary);
-                classSummary.setLength(0);
-            }
-        }
-        if (classSummary.length() > 0) {
-            DiagLogger.log("BT_DEX", "  Classes: " + classSummary);
-        }
-
-        boolean dumpAllClasses = (totalMethods <= 900);
-        for (int i = 0; i < classes.size(); i++) {
-            DexClassEntry ce = classes.get(i);
-            String low = ce.className.toLowerCase(Locale.US);
-            boolean isBleOrCore = dumpAllClasses || containsAny(low, new String[]{
-                    "le", "ble", "gatt", "scan", "client", "adapter", "btcm", "device", "service", "manager", "uuid"
-            });
-            if (!isBleOrCore) continue;
-
-            DiagLogger.log("BT_DEX", "  [CLASS] " + formatClassModifiers(ce.accessFlags) + ce.className
-                    + (ce.superName != null && !"java.lang.Object".equals(ce.superName)
-                    ? (" extends " + ce.superName) : ""));
-            for (int f = 0; f < ce.staticFields.size(); f++) {
-                DiagLogger.log("BT_DEX", "    field: " + ce.staticFields.get(f));
-            }
-            for (int m = 0; m < ce.declaredMethods.size(); m++) {
-                DiagLogger.log("BT_DEX", "    method: " + ce.declaredMethods.get(m));
-            }
-        }
-    }
-
-    private static void probeCandidateClassesInClassLoader(ClassLoader appLoader) {
+    private static void probeBroadcomRadioManagerReadOnly(ClassLoader appLoader) {
+        DiagLogger.log("BT_PROBE", "[6/7] Live ClassLoader & Broadcom BluetoothRadioManager read-only check:");
         String[] candidates = {
-            "com.broadcom.bt.le.api.BleAdapter",
-            "com.broadcom.bt.le.api.BleClientProfile",
-            "com.broadcom.bt.le.api.BleClientService",
-            "com.broadcom.bt.le.api.BleGattID",
-            "com.broadcom.bt.le.api.BleConstants",
-            "com.broadcom.bt.service.gatt.BluetoothGatt",
-            "com.broadcom.bt.hfdevice.hfbtcm.HfDeviceBTCMManager",
+            BroadcomGattEnabler.CLS_RADIO_MGR,
+            BroadcomGattEnabler.CLS_GATT_CB,
+            BroadcomGattEnabler.CLS_RADIO_CB,
+            "com.broadcom.bt.gatt.BluetoothGattExtras",
             "android.bluetooth.BluetoothGatt"
         };
-        DiagLogger.log("BT_PROBE", "[5/6] ClassLoader <uses-library com.broadcom.bt> link check:");
         for (int i = 0; i < candidates.length; i++) {
             String cname = candidates[i];
             try {
@@ -555,12 +528,29 @@ public final class BtStackProbe {
                 DiagLogger.log("BT_PROBE", "  Not in ClassLoader: " + cname + " (" + t.getClass().getSimpleName() + ")");
             }
         }
+
+        try {
+            Class<?> rmCls = Class.forName(BroadcomGattEnabler.CLS_RADIO_MGR, true, appLoader);
+            StringBuilder constSb = new StringBuilder();
+            Field[] fields = rmCls.getDeclaredFields();
+            for (int i = 0; i < fields.length; i++) {
+                Field f = fields[i];
+                if (Modifier.isStatic(f.getModifiers())) {
+                    f.setAccessible(true);
+                    Object v = f.get(null);
+                    if (constSb.length() > 0) constSb.append(", ");
+                    constSb.append(f.getName()).append('=').append(v);
+                }
+            }
+            DiagLogger.log("BT_PROBE", "  BluetoothRadioManager static fields: {" + constSb + "}");
+        } catch (Throwable t) {
+            DiagLogger.log("BT_PROBE", "  BluetoothRadioManager static inspect err: " + t);
+        }
     }
 
     private static void probeSystemFilesAndDaemons() {
-        DiagLogger.log("BT_PROBE", "[6/6] Read-only /system BT configs, libs, binaries & stack properties:");
+        DiagLogger.log("BT_PROBE", "[7/7] Read-only /system/etc/bluetooth configs, native libs, props & processes:");
 
-        // /system/etc/bluetooth/*
         File etcBt = new File("/system/etc/bluetooth");
         File[] etcFiles = etcBt.listFiles();
         if (etcFiles != null) {
@@ -574,11 +564,8 @@ public final class BtStackProbe {
                     logSmallConfigFile(f);
                 }
             }
-        } else {
-            DiagLogger.log("BT_SYS", "  /system/etc/bluetooth not listable");
         }
 
-        // /system/etc/permissions/*bt* or *broadcom*
         File permDir = new File("/system/etc/permissions");
         File[] permFiles = permDir.listFiles();
         if (permFiles != null) {
@@ -586,7 +573,7 @@ public final class BtStackProbe {
             for (int i = 0; i < permFiles.length; i++) {
                 File f = permFiles[i];
                 String low = f.getName().toLowerCase(Locale.US);
-                if (containsAny(low, new String[]{"bt", "blue", "broadcom", "brcm", "gatt", "ble"})) {
+                if (containsAny(low, new String[]{"bluetooth", "broadcom", "brcm"})) {
                     DiagLogger.log("BT_SYS", "  Permission XML: " + f.getAbsolutePath() + " (" + f.length() + "B)");
                     if (f.isFile() && f.canRead() && f.length() <= 4096) {
                         logSmallConfigFile(f);
@@ -595,18 +582,144 @@ public final class BtStackProbe {
             }
         }
 
-        // /system/bin & /system/lib matching bt|blue|brcm|bsa|gatt
         listMatchingFiles("/system/bin", new String[]{"bt", "blue", "brcm", "broadcom", "bsa", "gatt"});
-        listMatchingFiles("/system/lib", new String[]{"bt", "blue", "brcm", "broadcom", "bsa", "gatt"});
-        listMatchingFiles("/system/lib/hw", new String[]{"bt", "blue", "brcm", "broadcom", "bsa", "gatt"});
+        listMatchingFiles("/system/lib", new String[]{"bluetooth", "libbt", "brcm", "broadcom", "gatt"});
+        listMatchingFiles("/system/lib/hw", new String[]{"bluetooth", "bt", "brcm", "broadcom"});
 
-        // Filtered getprop (strictly BT/BLE keys, redacting any MAC octets)
         runFilteredCommand(new String[]{"/system/bin/getprop"}, "BT_PROP",
-                new String[]{"bt", "blue", "brcm", "broadcom", "bsa", "gatt", "ble"}, true);
+                new String[]{".bt", "bt.", "bluetooth", "brcm", "broadcom", "gatt", "ble."}, true);
 
-        // Filtered ps (strictly BT/BLE processes)
         runFilteredCommand(new String[]{"/system/bin/ps"}, "BT_PROC",
-                new String[]{"bt", "blue", "brcm", "broadcom", "bsa", "gatt", "dipo"}, false);
+                new String[]{"bluetooth", "btsettings", "btaudio", "brcm", "broadcom", "gatt", "dipo"}, false);
+    }
+
+    private static byte[] loadDexOrOdexBytes(File jarOrApk) {
+        if (jarOrApk == null) return null;
+        if (jarOrApk.isFile() && jarOrApk.canRead() && jarOrApk.length() > 0) {
+            ZipFile zf = null;
+            try {
+                zf = new ZipFile(jarOrApk);
+                ZipEntry dexEntry = zf.getEntry("classes.dex");
+                if (dexEntry != null && dexEntry.getSize() > 0 && dexEntry.getSize() <= MAX_DEX_BYTES) {
+                    return readStreamBounded(zf.getInputStream(dexEntry), MAX_DEX_BYTES);
+                }
+            } catch (Throwable ignored) {
+            } finally {
+                if (zf != null) {
+                    try { zf.close(); } catch (Throwable ignored) {}
+                }
+            }
+        }
+
+        // Check sibling .odex and arm/.odex
+        String baseName = jarOrApk.getName();
+        int dot = baseName.lastIndexOf('.');
+        String stem = (dot > 0) ? baseName.substring(0, dot) : baseName;
+        File parent = jarOrApk.getParentFile();
+        File[] odexCandidates = {
+            new File(parent, stem + ".odex"),
+            new File(new File(parent, "arm"), stem + ".odex")
+        };
+        for (int i = 0; i < odexCandidates.length; i++) {
+            File odex = odexCandidates[i];
+            if (odex.isFile() && odex.canRead() && odex.length() > 0 && odex.length() <= MAX_DEX_BYTES) {
+                FileInputStream fis = null;
+                try {
+                    fis = new FileInputStream(odex);
+                    DiagLogger.log("BT_DEX", "  Reading companion ODEX: " + odex.getAbsolutePath()
+                            + " (" + odex.length() + "B)");
+                    return readStreamBounded(fis, MAX_DEX_BYTES);
+                } catch (Throwable t) {
+                    DiagLogger.log("BT_DEX", "  Failed reading " + odex.getAbsolutePath() + ": " + t);
+                } finally {
+                    if (fis != null) {
+                        try { fis.close(); } catch (Throwable ignored) {}
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    private static void logTargetedDexInventory(String sourceName, byte[] rawBytes,
+                                                String[] parseFilterLower,
+                                                String[] detailKeywordsLower,
+                                                boolean listMatchedClassSummary) {
+        List<DexClassEntry> classes = extractDexInventory(rawBytes, parseFilterLower);
+        DiagLogger.log("BT_DEX", "Parsed " + sourceName + " (" + rawBytes.length + "B) -> "
+                + classes.size() + (parseFilterLower != null ? " filtered" : "") + " class(es)");
+        if (classes.isEmpty()) return;
+
+        if (listMatchedClassSummary) {
+            StringBuilder classSummary = new StringBuilder();
+            for (int i = 0; i < classes.size(); i++) {
+                if (classSummary.length() > 0) classSummary.append(", ");
+                classSummary.append(classes.get(i).className);
+                if (classSummary.length() >= 480) {
+                    DiagLogger.log("BT_DEX", "  Classes: " + classSummary);
+                    classSummary.setLength(0);
+                }
+            }
+            if (classSummary.length() > 0) {
+                DiagLogger.log("BT_DEX", "  Classes: " + classSummary);
+            }
+        }
+
+        for (int i = 0; i < classes.size(); i++) {
+            DexClassEntry ce = classes.get(i);
+            String low = ce.className.toLowerCase(Locale.US);
+            if (detailKeywordsLower != null && !containsAny(low, detailKeywordsLower)) {
+                continue;
+            }
+            DiagLogger.log("BT_DEX", "  [CLASS] " + formatClassModifiers(ce.accessFlags) + ce.className
+                    + (ce.superName != null && !"java.lang.Object".equals(ce.superName)
+                    ? (" extends " + ce.superName) : ""));
+            for (int f = 0; f < ce.staticFields.size(); f++) {
+                DiagLogger.log("BT_DEX", "    sfield: " + ce.staticFields.get(f));
+            }
+            for (int f = 0; f < ce.instanceFields.size(); f++) {
+                DiagLogger.log("BT_DEX", "    ifield: " + ce.instanceFields.get(f));
+            }
+            for (int m = 0; m < ce.declaredMethods.size(); m++) {
+                DiagLogger.log("BT_DEX", "    method: " + ce.declaredMethods.get(m));
+            }
+        }
+    }
+
+    private static void logMatchingDexStrings(String sourceName, byte[] rawBytes, String[] needlesLower) {
+        byte[] dex = unwrapOdexIfNeeded(rawBytes);
+        if (dex == null) return;
+        ByteBuffer buf = ByteBuffer.wrap(dex).order(ByteOrder.LITTLE_ENDIAN);
+        if (buf.getInt(40) != 0x12345678) return;
+
+        int stringIdsSize = buf.getInt(56);
+        int stringIdsOff = buf.getInt(60);
+        if (stringIdsSize <= 0 || stringIdsOff <= 0 || stringIdsOff + stringIdsSize * 4 > dex.length) {
+            return;
+        }
+
+        StringBuilder sb = new StringBuilder();
+        int matched = 0;
+        for (int i = 0; i < stringIdsSize && matched < 45; i++) {
+            String s = readDexString(dex, buf, stringIdsSize, stringIdsOff, i);
+            if (s == null || s.length() < 4 || s.length() > 110) continue;
+            // Skip raw descriptor signatures starting with '(' or '['
+            char c0 = s.charAt(0);
+            if (c0 == '(' || c0 == '[') continue;
+            String low = s.toLowerCase(Locale.US);
+            if (containsAny(low, needlesLower)) {
+                if (sb.length() > 0) sb.append(" | ");
+                sb.append('"').append(s.replace('\n', ' ')).append('"');
+                matched++;
+                if (sb.length() >= 440) {
+                    DiagLogger.log("BT_DEX", "  " + sourceName + " strings: " + sb);
+                    sb.setLength(0);
+                }
+            }
+        }
+        if (sb.length() > 0) {
+            DiagLogger.log("BT_DEX", "  " + sourceName + " strings: " + sb);
+        }
     }
 
     private static void logSmallConfigFile(File f) {
@@ -617,7 +730,10 @@ public final class BtStackProbe {
             int lineCount = 0;
             while ((line = br.readLine()) != null && lineCount < 60) {
                 String trimmed = line.trim();
-                if (trimmed.isEmpty() || trimmed.startsWith("#") || trimmed.startsWith("//")) continue;
+                if (trimmed.isEmpty() || trimmed.startsWith("#") || trimmed.startsWith("//")
+                        || trimmed.startsWith("<!--")) {
+                    continue;
+                }
                 DiagLogger.log("BT_CONF", "    " + f.getName() + ": " + redactMacOctets(trimmed));
                 lineCount++;
             }
@@ -680,39 +796,38 @@ public final class BtStackProbe {
         }
     }
 
-    private static String redactMacOctets(String s) {
+    /**
+     * Masks trailing 3 octets of both colon-delimited MACs (XX:XX:XX:**:**:**) and contiguous
+     * 12-hex-digit adapter addresses (e.g. ro.btaddr C8D9D2******).
+     */
+    public static String redactMacOctets(String s) {
         if (s == null) return "";
-        // Mask trailing 3 octets of any XX:XX:XX:XX:XX:XX MAC in system properties/configs
-        return s.replaceAll("(?i)([0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}):[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}",
+        String masked = s.replaceAll(
+                "(?i)([0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}):[0-9a-f]{2}:[0-9a-f]{2}:[0-9a-f]{2}",
                 "$1:**:**:**");
+        String low = masked.toLowerCase(Locale.US);
+        if (low.indexOf("addr") >= 0 || low.indexOf("mac") >= 0) {
+            masked = masked.replaceAll(
+                    "(?i)(?<![0-9a-f])([0-9a-f]{6})[0-9a-f]{6}(?![0-9a-f])",
+                    "$1******");
+        }
+        return masked;
     }
 
     // ================= PURE-JAVA IN-RAM DALVIK DEX / ODEX PARSER =================
 
+    public static List<DexClassEntry> extractDexInventory(byte[] rawBytes) {
+        return extractDexInventory(rawBytes, null);
+    }
+
     /**
      * Parses a Dalvik DEX ("dex\n035\0") or optimized ODEX ("dey\n036\0") byte buffer in RAM
-     * and returns all defined classes with their declared static fields and method signatures.
+     * and returns defined classes (optionally pre-filtered by lowercase substring match so large
+     * system archives like services.odex allocate zero objects for unrelated classes).
      */
-    public static List<DexClassEntry> extractDexInventory(byte[] rawBytes) {
-        if (rawBytes == null || rawBytes.length < 112) {
-            return Collections.emptyList();
-        }
-
-        byte[] dex = rawBytes;
-        // Unwrap Dalvik DexOptHeader ("dey\n036\0") if reading a .odex file
-        if (dex[0] == 'd' && dex[1] == 'e' && dex[2] == 'y' && dex[3] == '\n') {
-            ByteBuffer odexHdr = ByteBuffer.wrap(dex).order(ByteOrder.LITTLE_ENDIAN);
-            int dexOff = odexHdr.getInt(8);
-            int dexLen = odexHdr.getInt(12);
-            if (dexOff < 40 || dexLen < 112 || dexOff + dexLen > dex.length) {
-                return Collections.emptyList();
-            }
-            byte[] slice = new byte[dexLen];
-            System.arraycopy(dex, dexOff, slice, 0, dexLen);
-            dex = slice;
-        }
-
-        if (dex[0] != 'd' || dex[1] != 'e' || dex[2] != 'x' || dex[3] != '\n') {
+    public static List<DexClassEntry> extractDexInventory(byte[] rawBytes, String[] classFilterLower) {
+        byte[] dex = unwrapOdexIfNeeded(rawBytes);
+        if (dex == null) {
             return Collections.emptyList();
         }
 
@@ -739,20 +854,29 @@ public final class BtStackProbe {
             return Collections.emptyList();
         }
 
-        List<DexClassEntry> out = new ArrayList<DexClassEntry>(classDefsSize);
+        List<DexClassEntry> out = new ArrayList<DexClassEntry>(
+                classFilterLower == null ? classDefsSize : Math.min(classDefsSize, 64));
         for (int c = 0; c < classDefsSize; c++) {
             int cOff = classDefsOff + c * 32;
             int classIdx = buf.getInt(cOff);
+            String className = readTypeName(dex, buf, stringIdsSize, stringIdsOff, typeIdsSize, typeIdsOff, classIdx);
+            if (classFilterLower != null) {
+                String low = className.toLowerCase(Locale.US);
+                if (!containsAny(low, classFilterLower)) {
+                    continue;
+                }
+            }
+
             int accessFlags = buf.getInt(cOff + 4);
             int superIdx = buf.getInt(cOff + 8);
             int classDataOff = buf.getInt(cOff + 24);
 
-            String className = readTypeName(dex, buf, stringIdsSize, stringIdsOff, typeIdsSize, typeIdsOff, classIdx);
             String superName = (superIdx >= 0 && superIdx < typeIdsSize)
                     ? readTypeName(dex, buf, stringIdsSize, stringIdsOff, typeIdsSize, typeIdsOff, superIdx)
                     : null;
 
             List<String> staticFields = new ArrayList<String>();
+            List<String> instanceFields = new ArrayList<String>();
             List<String> methods = new ArrayList<String>();
 
             if (classDataOff > 0 && classDataOff < dex.length) {
@@ -769,9 +893,13 @@ public final class BtStackProbe {
                     staticFields.add(formatFieldSig(dex, buf, stringIdsSize, stringIdsOff,
                             typeIdsSize, typeIdsOff, fieldIdsSize, fieldIdsOff, fieldIdx, fAccess));
                 }
+
+                fieldIdx = 0;
                 for (int i = 0; i < instanceFieldsSize && pos[0] < dex.length; i++) {
-                    readUleb128(dex, pos);
-                    readUleb128(dex, pos);
+                    fieldIdx += readUleb128(dex, pos);
+                    int fAccess = readUleb128(dex, pos);
+                    instanceFields.add(formatFieldSig(dex, buf, stringIdsSize, stringIdsOff,
+                            typeIdsSize, typeIdsOff, fieldIdsSize, fieldIdsOff, fieldIdx, fAccess));
                 }
 
                 int methodIdx = 0;
@@ -801,7 +929,7 @@ public final class BtStackProbe {
                 }
             }
 
-            out.add(new DexClassEntry(className, superName, accessFlags, staticFields, methods));
+            out.add(new DexClassEntry(className, superName, accessFlags, staticFields, instanceFields, methods));
         }
 
         Collections.sort(out, new Comparator<DexClassEntry>() {
@@ -811,6 +939,28 @@ public final class BtStackProbe {
             }
         });
         return out;
+    }
+
+    private static byte[] unwrapOdexIfNeeded(byte[] rawBytes) {
+        if (rawBytes == null || rawBytes.length < 112) {
+            return null;
+        }
+        byte[] dex = rawBytes;
+        if (dex[0] == 'd' && dex[1] == 'e' && dex[2] == 'y' && dex[3] == '\n') {
+            ByteBuffer odexHdr = ByteBuffer.wrap(dex).order(ByteOrder.LITTLE_ENDIAN);
+            int dexOff = odexHdr.getInt(8);
+            int dexLen = odexHdr.getInt(12);
+            if (dexOff < 40 || dexLen < 112 || dexOff + dexLen > dex.length) {
+                return null;
+            }
+            byte[] slice = new byte[dexLen];
+            System.arraycopy(dex, dexOff, slice, 0, dexLen);
+            dex = slice;
+        }
+        if (dex[0] != 'd' || dex[1] != 'e' || dex[2] != 'x' || dex[3] != '\n') {
+            return null;
+        }
+        return dex;
     }
 
     private static int readUleb128(byte[] dex, int[] posRef) {
@@ -1000,22 +1150,6 @@ public final class BtStackProbe {
         }
         Collections.sort(sigs);
         DiagLogger.log("BT_PROBE", "  " + label + " methods (" + sigs.size() + "):");
-        for (int i = 0; i < sigs.size(); i++) {
-            DiagLogger.log("BT_PROBE", "    " + sigs.get(i));
-        }
-    }
-
-    private static void dumpFilteredClassMethods(String label, Class<?> cls, String[] keywords) {
-        Method[] methods = cls.getDeclaredMethods();
-        List<String> sigs = new ArrayList<String>();
-        for (int i = 0; i < methods.length; i++) {
-            String mname = methods[i].getName().toLowerCase(Locale.US);
-            if (containsAny(mname, keywords)) {
-                sigs.add(formatReflectMethod(methods[i]));
-            }
-        }
-        Collections.sort(sigs);
-        DiagLogger.log("BT_PROBE", "  " + label + " BLE/GATT/Discovery methods (" + sigs.size() + "):");
         for (int i = 0; i < sigs.size(); i++) {
             DiagLogger.log("BT_PROBE", "    " + sigs.get(i));
         }

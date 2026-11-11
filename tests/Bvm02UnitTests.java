@@ -112,6 +112,37 @@ public final class Bvm02UnitTests {
         Bvm02Protocol.DecodedFrame syncDec = Bvm02Protocol.decodeCompleteFrame(sync);
         assertTrue("sync frame valid", syncDec != null && syncDec.checksumValid && syncDec.cmd == 0x01);
 
+        // Real-hardware BVM02-BA71 (FW v1.14, HW rev 2) peripheral RX frames captured on Ioniq 5:
+        // 1) Cmd 0x01 SyncTime ACK: 0F 04 01 01 00 02 FF FF
+        Bvm02Protocol.DecodedFrame hwSyncAck = Bvm02Protocol.decodeCompleteFrame(
+                new byte[]{0x0F, 0x04, 0x01, 0x01, 0x00, 0x02, (byte) 0xFF, (byte) 0xFF});
+        assertTrue("FW v1.14 SyncTime ACK valid", hwSyncAck != null && hwSyncAck.checksumValid && hwSyncAck.cmd == 0x01);
+
+        // 2) Cmd 0x36 VerifyPIN ACK (accepted): 0F 04 36 01 01 37 FF FF
+        Bvm02Protocol.DecodedFrame hwPinAck = Bvm02Protocol.decodeCompleteFrame(
+                new byte[]{0x0F, 0x04, 0x36, 0x01, 0x01, 0x37, (byte) 0xFF, (byte) 0xFF});
+        assertTrue("FW v1.14 VerifyPIN ACK valid",
+                hwPinAck != null && hwPinAck.checksumValid && hwPinAck.cmd == 0x36 && hwPinAck.payload[0] == 1);
+
+        // 3) Cmd 0x20 Async event=2: 0F 06 20 01 02 00 00 24 FF FF
+        Bvm02Protocol.DecodedFrame hwAsyncEv = Bvm02Protocol.decodeCompleteFrame(
+                new byte[]{0x0F, 0x06, 0x20, 0x01, 0x02, 0x00, 0x00, 0x24, (byte) 0xFF, (byte) 0xFF});
+        assertTrue("FW v1.14 Async event 0x20 valid",
+                hwAsyncEv != null && hwAsyncEv.checksumValid && hwAsyncEv.cmd == 0x20 && hwAsyncEv.payload[0] == 2);
+
+        // 4) Corrupted peripheral RX frames still fail checksumValid
+        Bvm02Protocol.DecodedFrame hwPinBad = Bvm02Protocol.decodeCompleteFrame(
+                new byte[]{0x0F, 0x04, 0x36, 0x01, 0x01, (byte) 0x99, (byte) 0xFF, (byte) 0xFF});
+        assertTrue("Corrupted RX 0x36 ACK rejected", hwPinBad != null && !hwPinBad.checksumValid);
+
+        Bvm02Protocol.DecodedFrame hwAsyncBad = Bvm02Protocol.decodeCompleteFrame(
+                new byte[]{0x0F, 0x06, 0x20, 0x01, 0x02, 0x00, 0x00, (byte) 0x99, (byte) 0xFF, (byte) 0xFF});
+        assertTrue("Corrupted RX 0x20 event rejected", hwAsyncBad != null && !hwAsyncBad.checksumValid);
+
+        // Verify app & hook version constants match
+        assertEqualsStr("APP_VERSION == HOOK_VERSION",
+                Bvm02Protocol.APP_VERSION, bvm02.hook.BtHookEntry.HOOK_VERSION);
+
         // PIN validation checks
         assertTrue("valid pin 0000", Bvm02Protocol.isValidPin("0000"));
         assertTrue("valid pin 9182", Bvm02Protocol.isValidPin("9182"));
@@ -974,8 +1005,29 @@ public final class Bvm02UnitTests {
         assertTrue("issued HCI_LE_Connection_Update (0x2013)",
                 seenHciOpcodes.contains(Integer.valueOf(BleGattSessionManager.HCI_LE_CONNECTION_UPDATE)));
 
-        // Step F: Peripheral ATT_HANDLE_VALUE_IND (0x1D) -> immediate ATT_HANDLE_VALUE_CFM (0x1E)
+        // Step F: Unsolicited 10 Hz notification on non-0xFFF0 handle 0x0027 (Battery Service 0x180F)
+        //         is suppressed at the bridge, indication on 0x000A still receives ATT_HANDLE_VALUE_CFM,
+        //         and notification on discovered 0xFFF4 (handle 0x0018) emits CHAR_NOTIFY fff4!
+        emittedLines.clear();
         seenAttPdus.clear();
+        sendInboundL2capSingle(simMgr, 0x0040, BleGattSessionManager.L2CAP_CID_ATT, new byte[]{
+                (byte) BleGattSessionManager.ATT_HANDLE_VALUE_NTF, 0x27, 0x00, 0x00
+        });
+        sendInboundL2capSingle(simMgr, 0x0040, BleGattSessionManager.L2CAP_CID_ATT, new byte[]{
+                (byte) BleGattSessionManager.ATT_HANDLE_VALUE_IND, 0x0A, 0x00, 0x01, 0x00, (byte) 0xFF, (byte) 0xFF
+        });
+        sendInboundL2capSingle(simMgr, 0x0040, BleGattSessionManager.L2CAP_CID_ATT, new byte[]{
+                (byte) BleGattSessionManager.ATT_HANDLE_VALUE_NTF, 0x18, 0x00,
+                0x0F, 0x04, 0x36, 0x01, 0x01, 0x37, (byte) 0xFF, (byte) 0xFF
+        });
+        Thread.sleep(60L);
+        assertEquals("only 0xFFF4 notification emitted over bridge (0x0027 & 0x000A suppressed)", 1, emittedLines.size());
+        assertEqualsStr("emitted CHAR_NOTIFY fff4 payload",
+                "CHAR_NOTIFY fff4 0f0436010137ffff", emittedLines.get(0));
+        assertEquals("sent ATT_HANDLE_VALUE_CFM (0x1E) for non-0xFFF0 indication", 1, seenAttPdus.size());
+        assertEquals("ATT_HANDLE_VALUE_CFM opcode 0x1E",
+                BleGattSessionManager.ATT_HANDLE_VALUE_CFM, seenAttPdus.get(0)[0] & 0xFF);
+
         simMgr.executeSessionCommand(null, "DISCONNECT", collector);
         assertTrue("issued HCI_Disconnect (0x0406)",
                 seenHciOpcodes.contains(Integer.valueOf(BleGattSessionManager.HCI_DISCONNECT)));

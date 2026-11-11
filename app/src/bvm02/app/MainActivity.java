@@ -62,6 +62,7 @@ public class MainActivity extends Activity implements BleClient.Listener, DiagLo
     // Sidebar views
     private View layoutLogoHeader;
     private TextView tvTitle;
+    private TextView tvAppVersion;
     private TextView tvBleStatus;
     private Button btnQuickConnect;
     private Button btnTabMonitor;
@@ -247,6 +248,17 @@ public class MainActivity extends Activity implements BleClient.Listener, DiagLo
         // Sidebar
         layoutLogoHeader = findViewById(R.id.layout_logo_header);
         tvTitle = (TextView) findViewById(R.id.tv_title);
+        tvAppVersion = (TextView) findViewById(R.id.tv_app_version);
+        if (tvAppVersion != null) {
+            String ver = Bvm02Protocol.APP_VERSION;
+            try {
+                String pkgVer = getPackageManager().getPackageInfo(getPackageName(), 0).versionName;
+                if (pkgVer != null && !pkgVer.isEmpty()) {
+                    ver = pkgVer;
+                }
+            } catch (Throwable ignored) {}
+            tvAppVersion.setText("v" + ver);
+        }
         tvBleStatus = (TextView) findViewById(R.id.tv_ble_status);
         btnQuickConnect = (Button) findViewById(R.id.btn_quick_connect);
         btnTabMonitor = (Button) findViewById(R.id.btn_tab_monitor);

@@ -1146,17 +1146,13 @@ public final class BleClient {
 
         if (line.startsWith("CHAR_NOTIFY ")) {
             String[] parts = line.split("\\s+");
-            if (parts.length >= 4 && activeSensor != null) {
+            if (parts.length >= 3 && activeSensor != null) {
                 UUID uuid = expandShortUuid(parts[1]);
-                byte[] data = decodeHexOrEmpty(parts[2]);
-                // Wait: parts[0]="CHAR_NOTIFY", parts[1]=uuid, parts[2]=hex -> length >= 3!
-                rxNotifyCount++;
-                handleCharacteristicNotification(activeSensor, uuid, data);
-            } else if (parts.length == 3 && activeSensor != null) {
-                UUID uuid = expandShortUuid(parts[1]);
-                byte[] data = decodeHexOrEmpty(parts[2]);
-                rxNotifyCount++;
-                handleCharacteristicNotification(activeSensor, uuid, data);
+                if (Bvm02Protocol.UUID_CMD_NOTIFY.equals(uuid)) {
+                    byte[] data = decodeHexOrEmpty(parts[2]);
+                    rxNotifyCount++;
+                    handleCharacteristicNotification(activeSensor, uuid, data);
+                }
             }
             return;
         }
@@ -1289,7 +1285,10 @@ public final class BleClient {
             public void onCharacteristicChanged(final BluetoothGatt gatt,
                                                 final BluetoothGattCharacteristic characteristic) {
                 final UUID uuid = characteristic != null ? characteristic.getUuid() : null;
-                final byte[] data = copyBytes(characteristic != null ? characteristic.getValue() : null);
+                if (!Bvm02Protocol.UUID_CMD_NOTIFY.equals(uuid)) {
+                    return;
+                }
+                final byte[] data = copyBytes(characteristic.getValue());
                 mainHandler.post(new Runnable() {
                     @Override
                     public void run() {
@@ -1633,8 +1632,8 @@ public final class BleClient {
     }
 
     private void handleCharacteristicNotification(SensorConfig sensor, UUID uuid, byte[] data) {
-        DiagLogger.log("GATT_NOTIFY", shortUuid(uuid) + " (" + data.length + "B): " + Bvm02Protocol.bytesToHex(data));
         if (!Bvm02Protocol.UUID_CMD_NOTIFY.equals(uuid)) return;
+        DiagLogger.log("GATT_NOTIFY", shortUuid(uuid) + " (" + data.length + "B): " + Bvm02Protocol.bytesToHex(data));
 
         List<Bvm02Protocol.DecodedFrame> frames = rxAssembler.feed(data);
         for (Bvm02Protocol.DecodedFrame f : frames) {

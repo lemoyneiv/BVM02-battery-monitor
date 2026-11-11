@@ -236,7 +236,7 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
         worker.setDaemon(true);
         worker.start();
 
-        emitter.emitLine("OK STREAM_READY version=0.2.0");
+        emitter.emitLine("OK STREAM_READY version=" + BtHookEntry.HOOK_VERSION);
 
         try {
             String raw;
@@ -298,6 +298,9 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
     }
 
     public void executeSessionCommand(ModContext mod, String line, LineEmitter emitter) {
+        if (activeEmitter == null && emitter != null) {
+            activeEmitter = emitter;
+        }
         String[] parts = line.split("\\s+");
         if (parts.length == 0) return;
         String verb = parts[0];
@@ -1235,18 +1238,22 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
             }
             if (pdu.length >= 3) {
                 int valHandle = u16le(pdu, 1);
-                byte[] val = new byte[pdu.length - 3];
-                if (val.length > 0) {
-                    System.arraycopy(pdu, 3, val, 0, val.length);
-                }
                 DiscoveredChar ch;
                 synchronized (attLock) {
                     ch = charByValHandle.get(Integer.valueOf(valHandle));
                 }
-                String uuid = (ch != null) ? ch.shortUuid : String.format(Locale.US, "%04x", Integer.valueOf(valHandle));
+                // Suppress unsolicited notifications outside Service 0xFFF0 (e.g. FW v1.14 emits
+                // 10 Hz notifications on Battery Service 0x180F handle 0x0027 without CCCD write).
+                if (ch == null) {
+                    return;
+                }
+                byte[] val = new byte[pdu.length - 3];
+                if (val.length > 0) {
+                    System.arraycopy(pdu, 3, val, 0, val.length);
+                }
                 LineEmitter em = activeEmitter;
                 if (em != null) {
-                    em.emitLine("CHAR_NOTIFY " + uuid + " " + (val.length > 0 ? bytesToHex(val) : "-"));
+                    em.emitLine("CHAR_NOTIFY " + ch.shortUuid + " " + (val.length > 0 ? bytesToHex(val) : "-"));
                 }
             }
             return;

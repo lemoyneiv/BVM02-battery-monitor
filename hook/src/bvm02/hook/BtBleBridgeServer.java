@@ -56,7 +56,7 @@ public final class BtBleBridgeServer {
         try {
             server = new LocalServerSocket(SOCKET_NAME);
             if (mod != null) {
-                mod.log("BtBleBridgeServer v0.2.0 listening on abstract @" + SOCKET_NAME
+                mod.log("BtBleBridgeServer v" + BtHookEntry.HOOK_VERSION + " listening on abstract @" + SOCKET_NAME
                         + " in " + (app != null ? app.processName : "com.android.bluetooth"));
             }
             while (true) {
@@ -127,7 +127,9 @@ public final class BtBleBridgeServer {
 
         StringBuilder resp = new StringBuilder(512);
         if ("PING".equals(cmd)) {
-            resp.append("OK PONG version=0.2.0 pid=")
+            resp.append("OK PONG version=")
+                    .append(BtHookEntry.HOOK_VERSION)
+                    .append(" pid=")
                     .append(android.os.Process.myPid())
                     .append(" uid=")
                     .append(android.os.Process.myUid())

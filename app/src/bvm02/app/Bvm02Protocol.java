@@ -18,6 +18,8 @@ import java.util.UUID;
  */
 public final class Bvm02Protocol {
 
+    public static final String APP_VERSION = "0.2.1";
+
     private static final Charset UTF8 = Charset.forName("UTF-8");
 
     public static final String UUID_SERVICE_STR       = "0000fff0-0000-1000-8000-00805f9b34fb";
@@ -167,6 +169,39 @@ public final class Bvm02Protocol {
         return (byte) (sum & 0xFF);
     }
 
+    /**
+     * Validates a framed BVM02 packet's checksum byte at {@code frame[totalLen - 3]}.
+     *
+     * Supports:
+     *  1. Standard protocol checksum: {@code (1 + sum(bytes[2..N-4])) & 0xFF} (all host TX
+     *     frames and standard peripheral frames such as {@code 0x20} async events).
+     *  2. FW v1.14 peripheral RX direct sum ({@code frame[3] == 0x01}): {@code sum(bytes[2..N-4]) & 0xFF},
+     *     where the peripheral sets direction byte {@code frame[3] = 0x01} instead of adding +1
+     *     (e.g. {@code 0x01} SyncTime ACK {@code 0F 04 01 01 00 02 FF FF}).
+     *  3. FW v1.14 1-byte status ACK static template ({@code totalLen == 8 && frame[3] == 0x01}):
+     *     {@code ((cmd + 1) & 0xFF)}, where FW v1.14 writes {@code payload[0]} into a precomputed
+     *     8-byte ACK template without recomputing {@code frame[5]}
+     *     (e.g. {@code 0x36} VerifyPIN ACK {@code 0F 04 36 01 01 37 FF FF}).
+     */
+    public static boolean isValidFrameChecksum(byte[] frame, int totalLen) {
+        if (frame == null || totalLen < 7 || frame.length < totalLen) return false;
+        int actual = frame[totalLen - 3] & 0xFF;
+        int std = computeChecksum(frame, totalLen) & 0xFF;
+        if (actual == std) {
+            return true;
+        }
+        if ((frame[3] & 0xFF) == 0x01) {
+            int rawSum = (std - 1) & 0xFF;
+            if (actual == rawSum) {
+                return true;
+            }
+            if (totalLen == 8 && actual == (((frame[2] & 0xFF) + 1) & 0xFF)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
     public static DecodedFrame decodeCompleteFrame(byte[] frame) {
         if (frame == null || frame.length < 7) return null;
         if (frame[0] != FRAME_HEADER) return null;
@@ -179,8 +214,7 @@ public final class Bvm02Protocol {
         if (payloadLen > 0) {
             System.arraycopy(frame, 4, payload, 0, payloadLen);
         }
-        byte expectedCrc = computeChecksum(frame, expectedTotal);
-        boolean crcOk = (frame[expectedTotal - 3] == expectedCrc)
+        boolean crcOk = isValidFrameChecksum(frame, expectedTotal)
                 && (frame[expectedTotal - 2] == FRAME_TAIL)
                 && (frame[expectedTotal - 1] == FRAME_TAIL);
         return new DecodedFrame(cmd, payload, crcOk, bytesToHex(frame));

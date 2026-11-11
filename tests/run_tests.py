@@ -479,6 +479,20 @@ def test_shell_scripts_and_flash_safety() -> None:
     if "com.broadcom.bt" in manifest_xml:
         fail("AndroidManifest.xml must NOT link com.broadcom.bt on Telechips mbox Gen5W firmware!")
 
+    # Verify version consistency across mod.json, AndroidManifest.xml, activity_main.xml, app & hook constants
+    expected_ver = json.loads((BASE_DIR / "mod" / "mod.json").read_text(encoding="utf-8"))["version"]
+    if f'android:versionName="{expected_ver}"' not in manifest_xml:
+        fail(f"AndroidManifest.xml versionName does not match mod.json version {expected_ver}")
+    layout_xml = (BASE_DIR / "app" / "res" / "layout" / "activity_main.xml").read_text(encoding="utf-8")
+    if f'android:text="v{expected_ver}"' not in layout_xml:
+        fail(f"activity_main.xml tv_app_version text does not match v{expected_ver}")
+    proto_java = (BASE_DIR / "app" / "src" / "bvm02" / "app" / "Bvm02Protocol.java").read_text(encoding="utf-8")
+    if f'APP_VERSION = "{expected_ver}"' not in proto_java:
+        fail(f"Bvm02Protocol.APP_VERSION does not match {expected_ver}")
+    hook_entry_java = (BASE_DIR / "hook" / "src" / "bvm02" / "hook" / "BtHookEntry.java").read_text(encoding="utf-8")
+    if f'HOOK_VERSION = "{expected_ver}"' not in hook_entry_java:
+        fail(f"BtHookEntry.HOOK_VERSION does not match {expected_ver}")
+
     for critical_src in [
         BASE_DIR / "app" / "src" / "bvm02" / "app" / "BleClient.java",
         BASE_DIR / "app" / "src" / "bvm02" / "app" / "MainActivity.java",
@@ -488,7 +502,10 @@ def test_shell_scripts_and_flash_safety() -> None:
             if unsafe_tok in c_text:
                 fail(f"CRITICAL Gen5W safety violation: found '{unsafe_tok}' in {critical_src}")
 
-    print("  [OK] Zero internal eMMC logging, read-only hook/0xFFF1, system_server mbox safety, and UI terminology checks passed")
+    print(
+        f"  [OK] Zero internal eMMC logging, version sync (v{expected_ver}), read-only hook/0xFFF1, "
+        "system_server mbox safety, and UI terminology checks passed"
+    )
 
 
 def main() -> None:

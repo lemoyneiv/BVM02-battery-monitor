@@ -12,6 +12,7 @@ import hmgapi.hook.ModEntry;
  */
 public final class BtHookEntry extends ModEntry {
 
+    public static final String HOOK_VERSION = "0.2.1";
     private static final String BT_PACKAGE = "com.android.bluetooth";
 
     @Override
@@ -25,7 +26,7 @@ public final class BtHookEntry extends ModEntry {
             return;
         }
         if (mod != null) {
-            mod.log("BtHookEntry v0.2.0 active in " + app.processName
+            mod.log("BtHookEntry v" + HOOK_VERSION + " active in " + app.processName
                     + " (pid=" + android.os.Process.myPid()
                     + ", uid=" + android.os.Process.myUid() + ")");
         }

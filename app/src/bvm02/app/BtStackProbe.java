@@ -37,7 +37,7 @@ import java.util.zip.ZipEntry;
 import java.util.zip.ZipFile;
 
 /**
- * Strictly passive, read-only, in-RAM Gen5W Bluetooth, HAL, DEX bytecode & ELF32 stack introspector (v0.2.0).
+ * Strictly passive, read-only, in-RAM Gen5W Bluetooth, HAL, DEX bytecode & ELF32 stack introspector (v0.2.1).
  *
  * SAFETY INVARIANTS (Gen5W Telechips TCC803x tcc.solution.bluetooth.mbox=1):
  *  - NEVER invokes @hide Binder IPC methods on system_server (never calls enableGatt, enableRadio,
@@ -352,7 +352,8 @@ public final class BtStackProbe {
     }
 
     private static void runProbeInternal(Context ctx) {
-        DiagLogger.log("BT_PROBE", "=== BEGIN PASSIVE GEN5W BLUETOOTH HAL, DEX & ELF32 STACK PROBE (v0.2.0) ===");
+        DiagLogger.log("BT_PROBE", "=== BEGIN PASSIVE GEN5W BLUETOOTH HAL, DEX & ELF32 STACK PROBE (v"
+                + Bvm02Protocol.APP_VERSION + ") ===");
 
         BluetoothAdapter adapter = null;
         try {
@@ -393,7 +394,8 @@ public final class BtStackProbe {
         // 9. Unfiltered HAL directories, /dev nodes, USB sysfs, props & processes
         probeSystemFilesAndDaemons();
 
-        DiagLogger.log("BT_PROBE", "=== END PASSIVE GEN5W BLUETOOTH HAL, DEX & ELF32 STACK PROBE (v0.2.0) ===");
+        DiagLogger.log("BT_PROBE", "=== END PASSIVE GEN5W BLUETOOTH HAL, DEX & ELF32 STACK PROBE (v"
+                + Bvm02Protocol.APP_VERSION + ") ===");
     }
 
     private static void probeLiveBluetoothHookBridge() {

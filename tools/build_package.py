@@ -58,7 +58,14 @@ ZIPALIGN = os.path.join(BT_DIR, f"zipalign{exe_suffix}")
 D8_JAR = os.path.join(BT_DIR, "lib", "d8.jar")
 APKSIGNER_JAR = os.path.join(BT_DIR, "lib", "apksigner.jar")
 
-KEYS_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "build", "keys"))
+DEFAULT_KEYS_DIR = os.path.abspath(os.path.join(BASE_DIR, "..", "build", "keys"))
+PERSISTENT_GEMINI_DIR = os.path.expanduser("~/.gemini")
+if os.path.isfile(os.path.join(DEFAULT_KEYS_DIR, "author.key")):
+    KEYS_DIR = DEFAULT_KEYS_DIR
+elif os.path.isdir(PERSISTENT_GEMINI_DIR):
+    KEYS_DIR = os.path.join(PERSISTENT_GEMINI_DIR, "bvm02-keys")
+else:
+    KEYS_DIR = DEFAULT_KEYS_DIR
 AUTHOR_KEY = os.path.join(KEYS_DIR, "author.key")
 APP_KEYSTORE = os.path.join(KEYS_DIR, "bvm02-app.keystore")
 

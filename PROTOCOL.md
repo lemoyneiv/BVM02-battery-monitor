@@ -67,18 +67,25 @@ All commands written to `0xFFF3` and responses notified on `0xFFF4` share a 7-by
 
 ```text
 Offset:   [0]      [1]        [2]     [3]     [4 .. N-4]     [N-3]      [N-2]  [N-1]
-Value:   0x0F   (P_LEN + 3)   CMD    0x00     PAYLOAD...    CHECKSUM    0xFF   0xFF
+Value:   0x0F   (P_LEN + 3)   CMD    DIR      PAYLOAD...    CHECKSUM    0xFF   0xFF
 ```
 
+* **Direction Byte (`frame[3]`):** `0x00` on Host -> Peripheral (`0xFFF3` TX); `0x01` on Peripheral -> Host (`0xFFF4` RX).
 * **Total Frame Length (`N`):** `(frame[1] & 0xFF) + 4` = `payload.length + 7`.
 * **Checksum (`frame[N-3]`):**
-  ```java
-  int sum = 1;
-  for (int i = 2; i <= N - 4; i++) {
-      sum = (sum + (frame[i] & 0xFF)) & 0xFF;
-  }
-  byte checksum = (byte) sum;
-  ```
+  * **Host TX & Standard Peripheral RX (e.g. `0x20` async events):**
+    ```java
+    int sum = 1;
+    for (int i = 2; i <= N - 4; i++) {
+        sum = (sum + (frame[i] & 0xFF)) & 0xFF;
+    }
+    byte checksum = (byte) sum;
+    ```
+  * **Verified FW `v1.14` (`HW rev 2`) Peripheral Short-ACK Quirks (`frame[3] == 0x01`):**
+    * `0x01` SyncTime ACK (`0F 04 01 01 00 02 FF FF`) computes `sum(bytes[2..N-4]) & 0xFF` (`0x02`) without adding an extra `+1` on top of `frame[3] = 0x01`.
+    * `0x36` VerifyPIN ACK (`0F 04 36 01 01 37 FF FF`) populates `payload[0]` inside a static 8-byte ACK template whose checksum byte remains `(cmd + 1) & 0xFF` (`0x37`).
+    * `Bvm02Protocol.isValidFrameChecksum()` accepts all three verified variants while still rejecting corrupted frames.
+* **Unsolicited `0x180F` Notifications on FW `v1.14`:** Upon LE connection, FW `v1.14` emits unsolicited 10 Hz 1-byte notifications (`0x00`) on Battery Service (`0x180F`) value handle `0x0027` without a CCCD write. `@bvm02_ble` filters out notifications outside Service `0xFFF0` at the bridge to prevent unnecessary IPC wakeups.
 * **20-Byte ATT Reassembly (API 19):** Responses exceeding 20 bytes (such as `0x02`, `0x03`, and `0x30`) arrive split across consecutive `onCharacteristicChanged()` callbacks on `0xFFF4`. Read `(chunk[1] & 0xFF) + 4` on the leading `0x0F` header and accumulate chunks until `N` bytes are received (`Bvm02Protocol.FrameAssembler`).
 
 ---

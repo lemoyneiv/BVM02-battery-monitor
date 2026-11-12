@@ -21,6 +21,7 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public final class BtBleBridgeClient {
 
     public static final String SOCKET_NAME = "bvm02_ble";
+    public static final String GEN5W_SOCKET_NAME = "gen5w_ble";
     private static final Charset UTF8 = Charset.forName("UTF-8");
     private static final int TIMEOUT_MS = 2500;
 
@@ -99,13 +100,12 @@ public final class BtBleBridgeClient {
             Thread writerThread = null;
             String closeReason = "EOF";
             try {
-                sock = new LocalSocket();
-                sock.connect(new LocalSocketAddress(SOCKET_NAME, LocalSocketAddress.Namespace.ABSTRACT));
+                sock = connectBridgeSocket();
                 sock.setSoTimeout(4000);
                 this.socket = sock;
 
                 final OutputStream os = sock.getOutputStream();
-                os.write("STREAM_SESSION\n".getBytes(UTF8));
+                os.write("STREAM_SESSION BVM02\n".getBytes(UTF8));
                 os.flush();
 
                 BufferedReader br = new BufferedReader(new InputStreamReader(sock.getInputStream(), UTF8));
@@ -193,12 +193,24 @@ public final class BtBleBridgeClient {
         return session;
     }
 
+    static LocalSocket connectBridgeSocket() throws Exception {
+        LocalSocket s1 = new LocalSocket();
+        try {
+            s1.connect(new LocalSocketAddress(SOCKET_NAME, LocalSocketAddress.Namespace.ABSTRACT));
+            return s1;
+        } catch (Throwable firstErr) {
+            try { s1.close(); } catch (Throwable ignored) {}
+            LocalSocket s2 = new LocalSocket();
+            s2.connect(new LocalSocketAddress(GEN5W_SOCKET_NAME, LocalSocketAddress.Namespace.ABSTRACT));
+            return s2;
+        }
+    }
+
     public static BridgeResponse sendCommand(String command) {
         List<String> lines = new ArrayList<String>();
         LocalSocket sock = null;
         try {
-            sock = new LocalSocket();
-            sock.connect(new LocalSocketAddress(SOCKET_NAME, LocalSocketAddress.Namespace.ABSTRACT));
+            sock = connectBridgeSocket();
             sock.setSoTimeout(TIMEOUT_MS);
 
             OutputStream os = sock.getOutputStream();

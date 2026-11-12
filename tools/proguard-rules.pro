@@ -8,5 +8,7 @@
     public static final int SDK_INT return 19..19;
 }
 
-# Preserve all BVM02 application classes and methods
+# Preserve all BVM02 application classes and Gen5W BLE client SDK classes
 -keep class bvm02.app.** { *; }
+-keep class gen5w.ble.** { *; }
+

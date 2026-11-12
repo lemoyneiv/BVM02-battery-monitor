@@ -5,24 +5,44 @@ import java.io.ByteArrayOutputStream;
 import java.io.OutputStream;
 import java.nio.charset.Charset;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import hmgapi.hook.ModContext;
 
 /**
- * Coexistence-safe Bluetooth 4.x HCI LE Scanner, L2CAP Reassembler, and ATT/GATT Central
- * running inside {@code com.android.bluetooth} over {@link BtNativeBridge}.
+ * Coexistence-safe, multi-client, multi-connection Bluetooth 4.x HCI LE Scanner,
+ * L2CAP Fragmenter/Reassembler, and General-Purpose ATT/GATT Central running inside
+ * {@code com.android.bluetooth} over {@link BtNativeBridge}.
  *
  * Designed specifically for Gen5W head units where {@code GattService} is manifest-disabled
  * and {@code bplus.default.so} is compiled with {@code BLE_INCLUDED=FALSE}, while preserving
  * 100% of simultaneous Classic Bluetooth ({@code HFP} / {@code A2DP}) traffic.
+ *
+ * Supports:
+ * - Concurrent IPC stream clients across {@code @gen5w_ble} (generic GATT discovery) and
+ *   {@code @bvm02_ble} (BVM02 backwards-compatible defaults).
+ * - Multiple simultaneous BLE peripheral connections (up to {@link #MAX_CONCURRENT_CONNECTIONS}),
+ *   both across separate apps and within a single app via {@code MULTICONN 1} + {@code @<MAC>}.
+ * - Optional ATT MTU negotiation ({@code REQUEST_MTU} / {@code SET_MAX_MTU} up to 517 bytes),
+ *   automatic outbound LE ACL fragmentation across 27-byte BT 4.0 controller buffers, and
+ *   ATT long attribute reads ({@code READ_BLOB} / {@code READ_LONG_CHAR}).
  */
 public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
 
     private static final Charset UTF8 = Charset.forName("UTF-8");
+
+    public static final int MAX_CONCURRENT_CONNECTIONS        = 4;
+    public static final int DEFAULT_ATT_MTU                   = 23;
+    public static final int MAX_SUPPORTED_ATT_MTU             = 517;
+    public static final int DEFAULT_LE_ACL_MAX_LEN            = 27;
+    public static final int MAX_REASSEMBLED_L2CAP_LEN         = 520;
 
     // HCI Opcodes
     public static final int HCI_DISCONNECT                    = 0x0406;
@@ -50,6 +70,8 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
     public static final int ATT_READ_BY_TYPE_RSP              = 0x09;
     public static final int ATT_READ_REQ                      = 0x0A;
     public static final int ATT_READ_RSP                      = 0x0B;
+    public static final int ATT_READ_BLOB_REQ                 = 0x0C;
+    public static final int ATT_READ_BLOB_RSP                 = 0x0D;
     public static final int ATT_READ_BY_GROUP_TYPE_REQ        = 0x10;
     public static final int ATT_READ_BY_GROUP_TYPE_RSP        = 0x11;
     public static final int ATT_WRITE_REQ                     = 0x12;
@@ -86,6 +108,7 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
         public final int props;
         public int endHandle;
         public int cccdHandle;
+        public volatile boolean notifySubscribed;
 
         public DiscoveredChar(String shortUuid, int declHandle, int valHandle, int props) {
             this.shortUuid = shortUuid;
@@ -94,6 +117,72 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
             this.props = props;
             this.endHandle = valHandle;
             this.cccdHandle = 0;
+            this.notifySubscribed = false;
+        }
+    }
+
+    public static final class ClientSession {
+        public final int sessionId;
+        public final LineEmitter emitter;
+        public final boolean genericDefault;
+        volatile OutputStream socketOut;
+        volatile boolean active = true;
+        volatile boolean multiConnMode = false;
+        volatile boolean scanning = false;
+        volatile boolean cancelConnectRequested = false;
+        volatile int defaultServerMtu = DEFAULT_ATT_MTU;
+        volatile String primaryMac = "";
+        final Map<String, LeConnection> ownedByMac = new LinkedHashMap<String, LeConnection>();
+
+        ClientSession(int sessionId, LineEmitter emitter, boolean genericDefault, OutputStream socketOut) {
+            this.sessionId = sessionId;
+            this.emitter = emitter;
+            this.genericDefault = genericDefault;
+            this.socketOut = socketOut;
+        }
+
+        void emitRaw(String line) {
+            if (!active || emitter == null) return;
+            emitter.emitLine(line);
+        }
+
+        void emitForConn(String mac, String body) {
+            if (!active || emitter == null) return;
+            if (multiConnMode && mac != null && !mac.isEmpty()) {
+                emitter.emitLine("@" + mac + " " + body);
+            } else {
+                emitter.emitLine(body);
+            }
+        }
+    }
+
+    private static final class LeConnection {
+        final int handle;
+        final String mac;
+        final ClientSession owner;
+        final Object attLock = new Object();
+        final Map<String, DiscoveredChar> charByUuid = new LinkedHashMap<String, DiscoveredChar>();
+        final Map<Integer, DiscoveredChar> charByValHandle = new LinkedHashMap<Integer, DiscoveredChar>();
+        final Set<String> protectedWriteUuids = new HashSet<String>();
+
+        volatile boolean closed = false;
+        volatile int attMtu = DEFAULT_ATT_MTU;
+        volatile int preferredServerMtu = DEFAULT_ATT_MTU;
+
+        // Per-handle L2CAP reassembly state (protected by hciLock)
+        ByteArrayOutputStream l2capReassembly = null;
+        int l2capExpectedLen = 0;
+        int l2capCurrentCid = 0;
+
+        // Per-handle synchronous ATT request/response waiter (protected by attLock)
+        boolean attAwaitingResponse = false;
+        byte[] pendingAttResponse = null;
+
+        LeConnection(int handle, String mac, ClientSession owner, int initialServerMtu) {
+            this.handle = handle;
+            this.mac = mac;
+            this.owner = owner;
+            this.preferredServerMtu = clampMtu(initialServerMtu);
         }
     }
 
@@ -117,79 +206,112 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
 
     private final BtNativeBridge.Transport transport;
     private final Object hciLock = new Object();
-    private final Object attLock = new Object();
-    private final Object sessionSwapLock = new Object();
+    private final Object scanOpLock = new Object();
+    private final Object connectOpLock = new Object();
+    private final AtomicInteger nextSessionId = new AtomicInteger(1);
+
+    private final List<ClientSession> activeSessions = new CopyOnWriteArrayList<ClientSession>();
+    private final Map<LineEmitter, ClientSession> directSessions =
+            new LinkedHashMap<LineEmitter, ClientSession>();
+
+    // Active BLE connections indexed by handle and MAC (protected by hciLock)
+    private final Map<Integer, LeConnection> connectionsByHandle =
+            new LinkedHashMap<Integer, LeConnection>();
+    private final Map<String, LeConnection> connectionsByMac =
+            new LinkedHashMap<String, LeConnection>();
 
     // Cached advertising address types & merged AD payloads across scans
     private final Map<String, CachedAdvState> advCache = new LinkedHashMap<String, CachedAdvState>();
 
-    //HCI synchronous waiter state
+    // HCI synchronous command waiter state (protected by hciLock)
     private int waitingOpcode = -1;
     private byte[] completedCmdEvent = null;
     private int cmdStatusValue = -1;
 
-    // Connection / Scan state
+    // Controller & shared LE ACL credit state
     private boolean controllerInitialized = false;
+    private int controllerLeAclMaxLen = DEFAULT_LE_ACL_MAX_LEN;
     private int maxLeAclCredits = 2;
     private int inflightLeAclPkts = 0;
-    private volatile boolean scanning = false;
-    private volatile boolean cancelConnectRequested = false;
-    private volatile int activeConnHandle = -1;
-    private volatile String activeConnMac = "";
+    private volatile boolean hardwareScanning = false;
+    private volatile boolean connectInProgress = false;
     private byte[] pendingLeConnEvent = null;
-
-    // L2CAP reassembly buffer for activeConnHandle
-    private ByteArrayOutputStream l2capReassembly = null;
-    private int l2capExpectedLen = 0;
-    private int l2capCurrentCid = 0;
-
-    // ATT synchronous waiter & discovered GATT characteristics
-    private boolean attAwaitingResponse = false;
-    private byte[] pendingAttResponse = null;
-    private final Map<String, DiscoveredChar> charByUuid = new LinkedHashMap<String, DiscoveredChar>();
-    private final Map<Integer, DiscoveredChar> charByValHandle = new LinkedHashMap<Integer, DiscoveredChar>();
-
-    // Active stream session output emitter
-    private volatile LineEmitter activeEmitter = null;
-    private volatile OutputStream activeSessionSocketOut = null;
 
     public BleGattSessionManager(BtNativeBridge.Transport transport) {
         this.transport = transport;
     }
 
+    public String describeActiveSessions() {
+        int sessCount = activeSessions.size();
+        StringBuilder sb = new StringBuilder(128);
+        sb.append("sessions=").append(sessCount);
+        synchronized (hciLock) {
+            sb.append(" connections=").append(connectionsByHandle.size())
+                    .append('/').append(MAX_CONCURRENT_CONNECTIONS)
+                    .append(" leAclMaxLen=").append(controllerLeAclMaxLen)
+                    .append(" credits=").append(maxLeAclCredits - inflightLeAclPkts)
+                    .append('/').append(maxLeAclCredits)
+                    .append(" hwScan=").append(hardwareScanning);
+            if (!connectionsByHandle.isEmpty()) {
+                sb.append(" links=[");
+                boolean first = true;
+                for (LeConnection c : connectionsByHandle.values()) {
+                    if (!first) sb.append(',');
+                    first = false;
+                    sb.append(c.mac)
+                            .append("@0x").append(Integer.toHexString(c.handle))
+                            .append("(mtu=").append(c.attMtu).append(')');
+                }
+                sb.append(']');
+            }
+        }
+        return sb.toString();
+    }
+
     public void onModDisabled() {
-        cancelConnectRequested = true;
+        List<ClientSession> snapshot = new ArrayList<ClientSession>(activeSessions);
+        for (int i = 0; i < snapshot.size(); i++) {
+            ClientSession s = snapshot.get(i);
+            s.cancelConnectRequested = true;
+            s.scanning = false;
+        }
         synchronized (hciLock) {
             hciLock.notifyAll();
         }
-        synchronized (attLock) {
-            attLock.notifyAll();
+        for (int i = 0; i < snapshot.size(); i++) {
+            teardownSession(snapshot.get(i));
         }
-        cleanupSessionHardwareState();
-        closeActiveSocketStreamQuietly();
+        synchronized (directSessions) {
+            directSessions.clear();
+        }
+        transport.setFilterState(false, BtNativeBridge.HANDLE_OP_CLEAR_ALL);
     }
 
     /**
-     * Runs a full-duplex persistent BLE control & notification stream over {@code @bvm02_ble}.
-     * Preempts any stale prior client session cleanly.
+     * Backwards-compatible entry point (defaults to BVM02 profile rules).
      */
     public void runStreamSession(final ModContext mod, BufferedReader reader, final OutputStream os) {
-        synchronized (sessionSwapLock) {
-            cancelConnectRequested = true;
-            synchronized (hciLock) {
-                hciLock.notifyAll();
-            }
-            closeActiveSocketStreamQuietly();
-            cleanupSessionHardwareState();
-            activeSessionSocketOut = os;
-        }
+        runStreamSession(mod, reader, os, false);
+    }
 
+    /**
+     * Runs a full-duplex persistent BLE control & notification stream over {@code @gen5w_ble}
+     * ({@code genericDefault = true}) or {@code @bvm02_ble} ({@code genericDefault = false}).
+     * Multiple client sessions can run concurrently without preempting one another.
+     */
+    public void runStreamSession(
+            final ModContext mod,
+            BufferedReader reader,
+            final OutputStream os,
+            final boolean genericDefault) {
         final Object writeLock = new Object();
+        final ClientSession[] sessionRef = new ClientSession[1];
         final LineEmitter emitter = new LineEmitter() {
             @Override
             public void emitLine(String line) {
                 synchronized (writeLock) {
-                    if (activeSessionSocketOut != os) return;
+                    ClientSession s = sessionRef[0];
+                    if (s == null || !s.active) return;
                     try {
                         os.write((line + "\n").getBytes(UTF8));
                         os.flush();
@@ -197,8 +319,12 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
                 }
             }
         };
-        activeEmitter = emitter;
-        transport.setFilterState(true, -1);
+
+        final ClientSession session = new ClientSession(
+                nextSessionId.getAndIncrement(), emitter, genericDefault, os);
+        sessionRef[0] = session;
+        activeSessions.add(session);
+        transport.setFilterState(true, BtNativeBridge.HANDLE_OP_KEEP);
 
         final List<String> cmdQueue = new ArrayList<String>();
         final Object queueLock = new Object();
@@ -223,20 +349,20 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
                         cmdLine = cmdQueue.remove(0);
                     }
                     try {
-                        executeSessionCommand(mod, cmdLine, emitter);
+                        executeSessionCommand(mod, session, cmdLine);
                     } catch (Throwable cmdErr) {
                         if (mod != null) {
                             mod.log("BleGattSessionManager cmd err (" + cmdLine + "): " + cmdErr);
                         }
-                        emitter.emitLine("ERR CMD_EXCEPTION " + sanitizeToken(cmdErr.getMessage()));
+                        session.emitRaw("ERR CMD_EXCEPTION " + sanitizeToken(cmdErr.getMessage()));
                     }
                 }
             }
-        }, "Bvm02BleSessionWorker");
+        }, "Gen5wBleSession-" + session.sessionId);
         worker.setDaemon(true);
         worker.start();
 
-        emitter.emitLine("OK STREAM_READY version=" + BtHookEntry.HOOK_VERSION);
+        session.emitRaw("OK STREAM_READY version=" + BtHookEntry.HOOK_VERSION);
 
         try {
             String raw;
@@ -244,25 +370,23 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
                 String trimmed = raw.trim();
                 if (trimmed.isEmpty()) continue;
                 if ("QUIT".equals(trimmed)) {
-                    cancelConnectRequested = true;
+                    session.cancelConnectRequested = true;
                     synchronized (hciLock) {
                         hciLock.notifyAll();
                     }
+                    wakeAllSessionAttLocks(session);
                     break;
                 }
-                if ("DISCONNECT".equals(trimmed) || "SCAN_STOP".equals(trimmed)) {
-                    if ("DISCONNECT".equals(trimmed)) {
-                        cancelConnectRequested = true;
-                        synchronized (hciLock) {
-                            hciLock.notifyAll();
-                        }
-                        synchronized (attLock) {
-                            attLock.notifyAll();
-                        }
+                if (trimmed.equals("DISCONNECT") || trimmed.endsWith(" DISCONNECT")
+                        || trimmed.startsWith("DISCONNECT ")) {
+                    session.cancelConnectRequested = true;
+                    synchronized (hciLock) {
+                        hciLock.notifyAll();
                     }
+                    wakeAllSessionAttLocks(session);
                 }
                 synchronized (queueLock) {
-                    if (cmdQueue.size() < 64) {
+                    if (cmdQueue.size() < 128) {
                         cmdQueue.add(trimmed);
                         queueLock.notifyAll();
                     }
@@ -270,13 +394,11 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
             }
         } catch (Throwable ignored) {
         } finally {
-            cancelConnectRequested = true;
+            session.cancelConnectRequested = true;
             synchronized (hciLock) {
                 hciLock.notifyAll();
             }
-            synchronized (attLock) {
-                attLock.notifyAll();
-            }
+            wakeAllSessionAttLocks(session);
             synchronized (queueLock) {
                 readerDone[0] = true;
                 cmdQueue.clear();
@@ -286,35 +408,103 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
                 worker.join(2500L);
             } catch (InterruptedException ignored) {}
 
-            synchronized (sessionSwapLock) {
-                if (activeSessionSocketOut == os) {
-                    activeEmitter = null;
-                    activeSessionSocketOut = null;
-                    cleanupSessionHardwareState();
-                    transport.setFilterState(false, -1);
-                }
-            }
+            teardownSession(session);
         }
     }
 
-    public void executeSessionCommand(ModContext mod, String line, LineEmitter emitter) {
-        if (activeEmitter == null && emitter != null) {
-            activeEmitter = emitter;
+    /**
+     * Creates an in-process session handle (used by unit tests and embedded callers).
+     */
+    public ClientSession openDirectSession(LineEmitter emitter, boolean genericDefault) {
+        ClientSession s = new ClientSession(
+                nextSessionId.getAndIncrement(), emitter, genericDefault, null);
+        activeSessions.add(s);
+        synchronized (directSessions) {
+            if (emitter != null) {
+                directSessions.put(emitter, s);
+            }
         }
-        String[] parts = line.split("\\s+");
-        if (parts.length == 0) return;
+        transport.setFilterState(true, BtNativeBridge.HANDLE_OP_KEEP);
+        return s;
+    }
+
+    public void closeDirectSession(ClientSession session) {
+        if (session == null) return;
+        synchronized (directSessions) {
+            if (session.emitter != null && directSessions.get(session.emitter) == session) {
+                directSessions.remove(session.emitter);
+            }
+        }
+        teardownSession(session);
+    }
+
+    /**
+     * Backwards-compatible command entry point (auto-associates a BVM02-mode {@link ClientSession}
+     * with {@code emitter} if not already opened).
+     */
+    public void executeSessionCommand(ModContext mod, String line, LineEmitter emitter) {
+        ClientSession session;
+        synchronized (directSessions) {
+            session = directSessions.get(emitter);
+            if (session == null || !session.active) {
+                session = new ClientSession(
+                        nextSessionId.getAndIncrement(), emitter, false, null);
+                directSessions.put(emitter, session);
+                activeSessions.add(session);
+                transport.setFilterState(true, BtNativeBridge.HANDLE_OP_KEEP);
+            }
+        }
+        executeSessionCommand(mod, session, line);
+    }
+
+    public void executeSessionCommand(ModContext mod, ClientSession session, String line) {
+        if (session == null || line == null) return;
+        String trimmed = line.trim();
+        if (trimmed.isEmpty()) return;
+        String[] rawParts = trimmed.split("\\s+");
+        if (rawParts.length == 0) return;
+
+        String explicitMac = null;
+        String[] parts = rawParts;
+        if (rawParts[0].startsWith("@") && rawParts[0].length() > 1) {
+            explicitMac = rawParts[0].substring(1).toUpperCase(Locale.US);
+            if (rawParts.length < 2) {
+                session.emitRaw("ERR MISSING_CMD_AFTER_TARGET");
+                return;
+            }
+            parts = new String[rawParts.length - 1];
+            System.arraycopy(rawParts, 1, parts, 0, parts.length);
+        }
+
         String verb = parts[0];
 
         if ("PING".equals(verb)) {
-            emitter.emitLine("PONG");
+            session.emitRaw("PONG");
+            return;
+        }
+        if ("MULTICONN".equals(verb)) {
+            boolean en = parts.length < 2 || !"0".equals(parts[1]);
+            session.multiConnMode = en;
+            session.emitRaw("OP_OK MULTICONN " + (en ? "1" : "0"));
+            return;
+        }
+        if ("SET_MAX_MTU".equals(verb) && parts.length >= 2) {
+            int mtu = parsePositiveInt(parts[1], DEFAULT_ATT_MTU);
+            int clamped = clampMtu(mtu);
+            session.defaultServerMtu = clamped;
+            LeConnection active = resolveSessionConnection(session, explicitMac);
+            if (active != null) {
+                active.preferredServerMtu = clamped;
+            }
+            session.emitForConn(explicitMac, "OP_OK SET_MAX_MTU " + clamped);
             return;
         }
         if ("SCAN_START".equals(verb)) {
-            startBleScan(mod, emitter);
+            startBleScan(mod, session);
             return;
         }
         if ("SCAN_STOP".equals(verb)) {
-            stopBleScan(emitter);
+            stopBleScan(mod, session, true);
             return;
         }
         if ("CONNECT".equals(verb) && parts.length >= 2) {
@@ -325,36 +515,156 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
                     addrTypeHint = Integer.parseInt(parts[2]);
                 } catch (NumberFormatException ignored) {}
             }
-            connectAndDiscover(mod, mac, addrTypeHint, emitter);
+            String serviceFilter = null;
+            if (parts.length >= 4) {
+                serviceFilter = parts[3];
+            }
+            connectAndDiscover(mod, session, mac, addrTypeHint, serviceFilter);
             return;
         }
         if ("DISCONNECT".equals(verb)) {
-            disconnectActiveLink(emitter, "USER_REQUESTED");
+            String target = explicitMac;
+            if (target == null && parts.length >= 2) {
+                target = parts[1].toUpperCase(Locale.US);
+            }
+            if ("ALL".equals(target) || "*".equals(target)) {
+                disconnectAllSessionLinks(session, true, "USER_REQUESTED");
+            } else {
+                LeConnection conn = resolveSessionConnection(session, target);
+                if (conn != null) {
+                    disconnectConnection(conn, true, "USER_REQUESTED");
+                } else if (target != null && !target.isEmpty()) {
+                    session.emitForConn(target, "CONN_STATE DISCONNECTED " + target + " status=0 reason=NOT_CONNECTED");
+                }
+            }
+            return;
+        }
+        if ("REQUEST_MTU".equals(verb) && parts.length >= 2) {
+            int desiredMtu = parsePositiveInt(parts[1], DEFAULT_ATT_MTU);
+            handleRequestMtu(session, explicitMac, desiredMtu);
+            return;
+        }
+        if ("PROTECT_CHAR".equals(verb) && parts.length >= 2) {
+            String uuid = normalizeUuidKey(parts[1]);
+            handleProtectChar(session, explicitMac, uuid);
             return;
         }
         if ("ENABLE_NOTIFY".equals(verb) && parts.length >= 2) {
             String uuid = normalizeUuidKey(parts[1]);
-            handleEnableNotify(uuid, emitter);
+            handleEnableNotify(session, explicitMac, uuid);
+            return;
+        }
+        if ("DISABLE_NOTIFY".equals(verb) && parts.length >= 2) {
+            String uuid = normalizeUuidKey(parts[1]);
+            handleDisableNotify(session, explicitMac, uuid);
             return;
         }
         if ("READ_CHAR".equals(verb) && parts.length >= 2) {
             String uuid = normalizeUuidKey(parts[1]);
-            handleReadChar(uuid, emitter);
+            handleReadChar(session, explicitMac, uuid);
+            return;
+        }
+        if ("READ_BLOB".equals(verb) && parts.length >= 3) {
+            String uuid = normalizeUuidKey(parts[1]);
+            int offset = parsePositiveInt(parts[2], 0);
+            handleReadBlob(session, explicitMac, uuid, offset);
+            return;
+        }
+        if ("READ_LONG_CHAR".equals(verb) && parts.length >= 2) {
+            String uuid = normalizeUuidKey(parts[1]);
+            handleReadLongChar(session, explicitMac, uuid);
             return;
         }
         if ("WRITE_CHAR".equals(verb) && parts.length >= 3) {
             String uuid = normalizeUuidKey(parts[1]);
             byte[] payload = hexToBytes(parts[2]);
-            handleWriteChar(uuid, payload, emitter);
+            handleWriteChar(session, explicitMac, uuid, payload, false);
             return;
         }
-        emitter.emitLine("ERR UNKNOWN_SESSION_CMD " + sanitizeToken(verb));
+        if ("WRITE_CHAR_NR".equals(verb) && parts.length >= 3) {
+            String uuid = normalizeUuidKey(parts[1]);
+            byte[] payload = hexToBytes(parts[2]);
+            handleWriteChar(session, explicitMac, uuid, payload, true);
+            return;
+        }
+
+        session.emitForConn(explicitMac, "ERR UNKNOWN_SESSION_CMD " + sanitizeToken(verb));
     }
 
-    // ================= CONTROLLER INIT, SCAN & CONNECT =================
+    // ================= SESSION & CONNECTION LIFECYCLE =================
+
+    private void wakeAllSessionAttLocks(ClientSession session) {
+        List<LeConnection> list;
+        synchronized (session.ownedByMac) {
+            list = new ArrayList<LeConnection>(session.ownedByMac.values());
+        }
+        for (int i = 0; i < list.size(); i++) {
+            LeConnection c = list.get(i);
+            synchronized (c.attLock) {
+                c.attLock.notifyAll();
+            }
+        }
+    }
+
+    private void teardownSession(ClientSession session) {
+        if (session == null) return;
+        session.active = false;
+        session.scanning = false;
+        session.cancelConnectRequested = true;
+        activeSessions.remove(session);
+
+        syncHardwareScanState(null);
+        disconnectAllSessionLinks(session, false, "SESSION_CLOSED");
+
+        OutputStream out = session.socketOut;
+        session.socketOut = null;
+        if (out != null) {
+            try { out.close(); } catch (Throwable ignored) {}
+        }
+
+        boolean anyLeft = !activeSessions.isEmpty();
+        int remainingConns;
+        synchronized (hciLock) {
+            remainingConns = connectionsByHandle.size();
+        }
+        if (!anyLeft && remainingConns == 0) {
+            transport.setFilterState(false, BtNativeBridge.HANDLE_OP_CLEAR_ALL);
+        }
+    }
+
+    private LeConnection resolveSessionConnection(ClientSession session, String explicitMac) {
+        synchronized (session.ownedByMac) {
+            if (explicitMac != null && !explicitMac.isEmpty()) {
+                return session.ownedByMac.get(explicitMac);
+            }
+            if (!session.primaryMac.isEmpty()) {
+                LeConnection primary = session.ownedByMac.get(session.primaryMac);
+                if (primary != null) return primary;
+            }
+            if (!session.ownedByMac.isEmpty()) {
+                return session.ownedByMac.values().iterator().next();
+            }
+            return null;
+        }
+    }
+
+    private void refreshSessionPrimaryMac(ClientSession session) {
+        synchronized (session.ownedByMac) {
+            if (session.ownedByMac.containsKey(session.primaryMac)) {
+                return;
+            }
+            String last = "";
+            for (String m : session.ownedByMac.keySet()) {
+                last = m;
+            }
+            session.primaryMac = last;
+        }
+    }
+
+    // ================= CONTROLLER INIT, SHARED SCAN & MULTI-CONNECT =================
 
     private boolean ensureControllerLeReady(ModContext mod) {
-        transport.setFilterState(true, activeConnHandle);
+        transport.setFilterState(true, BtNativeBridge.HANDLE_OP_KEEP);
         if (controllerInitialized) {
             return true;
         }
@@ -382,14 +692,15 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
         if (bufRsp != null && bufRsp.length >= 9 && (bufRsp[5] & 0xFF) == 0) {
             int lePktLen = u16le(bufRsp, 6);
             int leNumPkts = bufRsp[8] & 0xFF;
+            controllerLeAclMaxLen = (lePktLen >= DEFAULT_LE_ACL_MAX_LEN) ? lePktLen : DEFAULT_LE_ACL_MAX_LEN;
             if (leNumPkts > 0) {
                 maxLeAclCredits = Math.min(leNumPkts, 4);
             } else {
                 maxLeAclCredits = 2; // Shared BR/EDR ACL pool: cap conservatively to protect A2DP
             }
             if (mod != null) {
-                mod.log("Controller LE ready: leAclLen=" + lePktLen + " leNumPkts=" + leNumPkts
-                        + " creditCap=" + maxLeAclCredits);
+                mod.log("Controller LE ready: leAclLen=" + controllerLeAclMaxLen + " (raw=" + lePktLen
+                        + ") leNumPkts=" + leNumPkts + " creditCap=" + maxLeAclCredits);
             }
         }
 
@@ -397,12 +708,70 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
         return true;
     }
 
-    private void startBleScan(ModContext mod, LineEmitter emitter) {
+    private boolean anySessionWantsScan() {
+        for (int i = 0; i < activeSessions.size(); i++) {
+            ClientSession s = activeSessions.get(i);
+            if (s.active && s.scanning) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private void startBleScan(ModContext mod, ClientSession session) {
         if (!ensureControllerLeReady(mod)) {
-            emitter.emitLine("SCAN_STATE 0 ERR_CONTROLLER_INIT");
+            session.emitRaw("SCAN_STATE 0 ERR_CONTROLLER_INIT");
             return;
         }
+        synchronized (scanOpLock) {
+            session.scanning = true;
+            if (connectInProgress) {
+                // Scan will automatically resume as soon as the in-flight connection attempt finishes
+                session.emitRaw("SCAN_STATE 1");
+                return;
+            }
+            if (hardwareScanning) {
+                session.emitRaw("SCAN_STATE 1");
+                return;
+            }
+            String err = enableHardwareScanLocked();
+            if (err != null) {
+                session.scanning = false;
+                session.emitRaw("SCAN_STATE 0 " + err);
+            } else {
+                session.emitRaw("SCAN_STATE 1");
+            }
+        }
+    }
 
+    private void stopBleScan(ModContext mod, ClientSession session, boolean emitReply) {
+        synchronized (scanOpLock) {
+            session.scanning = false;
+            if (!anySessionWantsScan() && hardwareScanning) {
+                sendHciCmdSync(HCI_LE_SET_SCAN_ENABLE, new byte[]{0x00, 0x00}, 1000L);
+                hardwareScanning = false;
+            }
+        }
+        if (emitReply) {
+            session.emitRaw("SCAN_STATE 0");
+        }
+    }
+
+    private void syncHardwareScanState(ModContext mod) {
+        synchronized (scanOpLock) {
+            boolean want = anySessionWantsScan() && !connectInProgress;
+            if (want && !hardwareScanning) {
+                if (ensureControllerLeReady(mod)) {
+                    enableHardwareScanLocked();
+                }
+            } else if (!want && hardwareScanning) {
+                sendHciCmdSync(HCI_LE_SET_SCAN_ENABLE, new byte[]{0x00, 0x00}, 1000L);
+                hardwareScanning = false;
+            }
+        }
+    }
+
+    private String enableHardwareScanLocked() {
         // Cleanly clear any stale scan state first
         sendHciCmdSync(HCI_LE_SET_SCAN_ENABLE, new byte[]{0x00, 0x00}, 800L);
 
@@ -417,47 +786,64 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
         byte[] paramRsp = sendHciCmdSync(HCI_LE_SET_SCAN_PARAMETERS, scanParams, 1200L);
         if (paramRsp == null || paramRsp.length < 6 || (paramRsp[5] & 0xFF) != 0) {
             int st = (paramRsp != null && paramRsp.length >= 6) ? (paramRsp[5] & 0xFF) : -1;
-            emitter.emitLine("SCAN_STATE 0 ERR_SCAN_PARAMS_" + st);
-            return;
+            hardwareScanning = false;
+            return "ERR_SCAN_PARAMS_" + st;
         }
 
         // Enable scan with Filter_Duplicates=0x00 so SCAN_RSP updates always arrive
         byte[] enRsp = sendHciCmdSync(HCI_LE_SET_SCAN_ENABLE, new byte[]{0x01, 0x00}, 1200L);
         if (enRsp == null || enRsp.length < 6 || (enRsp[5] & 0xFF) != 0) {
             int st = (enRsp != null && enRsp.length >= 6) ? (enRsp[5] & 0xFF) : -1;
-            scanning = false;
-            emitter.emitLine("SCAN_STATE 0 ERR_SCAN_ENABLE_" + st);
-            return;
+            hardwareScanning = false;
+            return "ERR_SCAN_ENABLE_" + st;
         }
 
-        scanning = true;
-        emitter.emitLine("SCAN_STATE 1");
+        hardwareScanning = true;
+        return null;
     }
 
-    private void stopBleScan(LineEmitter emitter) {
-        if (scanning) {
-            sendHciCmdSync(HCI_LE_SET_SCAN_ENABLE, new byte[]{0x00, 0x00}, 1000L);
-            scanning = false;
-        }
-        if (emitter != null) {
-            emitter.emitLine("SCAN_STATE 0");
-        }
-    }
-
-    private void connectAndDiscover(ModContext mod, String mac, int addrTypeHint, LineEmitter emitter) {
+    private void connectAndDiscover(
+            ModContext mod,
+            ClientSession session,
+            String mac,
+            int addrTypeHint,
+            String explicitServiceFilter) {
         byte[] macLe = parseMacToLittleEndian(mac);
         if (macLe == null) {
-            emitter.emitLine("CONN_STATE DISCONNECTED " + mac + " status=255 reason=INVALID_MAC");
+            session.emitForConn(mac, "CONN_STATE DISCONNECTED " + mac + " status=255 reason=INVALID_MAC");
             return;
         }
         if (!ensureControllerLeReady(mod)) {
-            emitter.emitLine("CONN_STATE DISCONNECTED " + mac + " status=254 reason=ERR_CONTROLLER_INIT");
+            session.emitForConn(mac, "CONN_STATE DISCONNECTED " + mac + " status=254 reason=ERR_CONTROLLER_INIT");
             return;
         }
 
-        // Always stop scan and close any prior LE link before HCI_LE_Create_Connection
-        stopBleScan(null);
-        disconnectActiveLink(null, null);
+        // In legacy single-connection mode, stop this session's scan & close its previous link first
+        if (!session.multiConnMode) {
+            stopBleScan(mod, session, false);
+            disconnectAllSessionLinks(session, false, null);
+        } else {
+            // If this session already owns a link to the exact same MAC, close that stale link first
+            LeConnection sameMacOwn;
+            synchronized (session.ownedByMac) {
+                sameMacOwn = session.ownedByMac.get(mac);
+            }
+            if (sameMacOwn != null) {
+                disconnectConnection(sameMacOwn, false, null);
+            }
+        }
+
+        synchronized (hciLock) {
+            LeConnection existingOther = connectionsByMac.get(mac);
+            if (existingOther != null && !existingOther.closed) {
+                session.emitForConn(mac, "CONN_STATE DISCONNECTED " + mac + " status=253 reason=ALREADY_CONNECTED");
+                return;
+            }
+            if (connectionsByHandle.size() >= MAX_CONCURRENT_CONNECTIONS) {
+                session.emitForConn(mac, "CONN_STATE DISCONNECTED " + mac + " status=252 reason=MAX_CONNECTIONS_REACHED");
+                return;
+            }
+        }
 
         int[] candidateAddrTypes;
         if (addrTypeHint == 0 || addrTypeHint == 1) {
@@ -468,148 +854,209 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
                 int primary = cached.intValue();
                 candidateAddrTypes = new int[]{primary, primary == 0 ? 1 : 0};
             } else {
-                // Unknown address type (e.g., manual Add by MAC): try Public (0) then Random (1)
                 candidateAddrTypes = new int[]{0, 1};
             }
         }
 
-        cancelConnectRequested = false;
-        emitter.emitLine("CONN_STATE CONNECTING " + mac);
+        session.cancelConnectRequested = false;
+        session.emitForConn(mac, "CONN_STATE CONNECTING " + mac);
 
-        byte[] connEvt = null;
-        int lastStatus = -1;
-        for (int attempt = 0; attempt < candidateAddrTypes.length; attempt++) {
-            if (cancelConnectRequested) {
-                emitter.emitLine("CONN_STATE DISCONNECTED " + mac + " status=0 reason=CANCELED");
-                return;
-            }
-            int peerAddrType = candidateAddrTypes[attempt];
-            long waitMs = (candidateAddrTypes.length == 1) ? 9500L : 5500L;
-
-            synchronized (hciLock) {
-                pendingLeConnEvent = null;
-            }
-
-            byte[] createParams = buildLeCreateConnParams(macLe, peerAddrType);
-            int cmdStatus = sendHciCmdStatusSync(HCI_LE_CREATE_CONNECTION, createParams, 1500L);
-            if (cmdStatus != 0) {
-                lastStatus = cmdStatus;
-                // 0x0C = Command Disallowed (stale pending create_conn): cancel once and retry
-                if (cmdStatus == 0x0C) {
-                    sendHciCmdSync(HCI_LE_CREATE_CONNECTION_CANCEL, new byte[0], 1000L);
-                }
-                continue;
-            }
-
-            long deadline = System.currentTimeMillis() + waitMs;
-            synchronized (hciLock) {
-                while (pendingLeConnEvent == null && !cancelConnectRequested) {
-                    long rem = deadline - System.currentTimeMillis();
-                    if (rem <= 0L) break;
-                    try {
-                        hciLock.wait(rem);
-                    } catch (InterruptedException ie) {
-                        break;
+        LeConnection established = null;
+        synchronized (connectOpLock) {
+            connectInProgress = true;
+            try {
+                // Pause hardware scan while controller initiator state machine runs
+                synchronized (scanOpLock) {
+                    if (hardwareScanning) {
+                        sendHciCmdSync(HCI_LE_SET_SCAN_ENABLE, new byte[]{0x00, 0x00}, 800L);
+                        hardwareScanning = false;
                     }
                 }
-                connEvt = pendingLeConnEvent;
-                pendingLeConnEvent = null;
-            }
 
-            if (connEvt != null) {
-                int st = connEvt[3] & 0xFF;
-                lastStatus = st;
-                if (st == 0) {
-                    break;
-                }
-                connEvt = null;
-            } else {
-                // Cancel pending initiator state in controller before next attempt or exit
-                sendHciCmdSync(HCI_LE_CREATE_CONNECTION_CANCEL, new byte[0], 1000L);
-                // Consume the 0x02 (Unknown Connection Identifier / Canceled) LE_Connection_Complete event
-                synchronized (hciLock) {
-                    if (pendingLeConnEvent == null) {
-                        try { hciLock.wait(350L); } catch (InterruptedException ignored) {}
+                byte[] connEvt = null;
+                int lastStatus = -1;
+                for (int attempt = 0; attempt < candidateAddrTypes.length; attempt++) {
+                    if (session.cancelConnectRequested || !session.active) {
+                        session.emitForConn(mac, "CONN_STATE DISCONNECTED " + mac + " status=0 reason=CANCELED");
+                        return;
                     }
-                    if (pendingLeConnEvent != null && (pendingLeConnEvent[3] & 0xFF) == 0) {
+                    int peerAddrType = candidateAddrTypes[attempt];
+                    long waitMs = (candidateAddrTypes.length == 1) ? 9500L : 5500L;
+
+                    synchronized (hciLock) {
+                        pendingLeConnEvent = null;
+                    }
+
+                    byte[] createParams = buildLeCreateConnParams(macLe, peerAddrType);
+                    int cmdStatus = sendHciCmdStatusSync(HCI_LE_CREATE_CONNECTION, createParams, 1500L);
+                    if (cmdStatus != 0) {
+                        lastStatus = cmdStatus;
+                        if (cmdStatus == 0x0C) {
+                            sendHciCmdSync(HCI_LE_CREATE_CONNECTION_CANCEL, new byte[0], 1000L);
+                        }
+                        continue;
+                    }
+
+                    long deadline = System.currentTimeMillis() + waitMs;
+                    synchronized (hciLock) {
+                        while (pendingLeConnEvent == null && !session.cancelConnectRequested && session.active) {
+                            long rem = deadline - System.currentTimeMillis();
+                            if (rem <= 0L) break;
+                            try {
+                                hciLock.wait(rem);
+                            } catch (InterruptedException ie) {
+                                break;
+                            }
+                        }
                         connEvt = pendingLeConnEvent;
+                        pendingLeConnEvent = null;
                     }
-                    pendingLeConnEvent = null;
+
+                    if (connEvt != null) {
+                        int st = connEvt[3] & 0xFF;
+                        lastStatus = st;
+                        if (st == 0) {
+                            break;
+                        }
+                        connEvt = null;
+                    } else {
+                        sendHciCmdSync(HCI_LE_CREATE_CONNECTION_CANCEL, new byte[0], 1000L);
+                        synchronized (hciLock) {
+                            if (pendingLeConnEvent == null) {
+                                try { hciLock.wait(350L); } catch (InterruptedException ignored) {}
+                            }
+                            if (pendingLeConnEvent != null && (pendingLeConnEvent[3] & 0xFF) == 0) {
+                                connEvt = pendingLeConnEvent;
+                            }
+                            pendingLeConnEvent = null;
+                        }
+                        if (connEvt != null) {
+                            break;
+                        }
+                        lastStatus = 133;
+                    }
                 }
-                if (connEvt != null) {
-                    break;
+
+                if (session.cancelConnectRequested || !session.active) {
+                    if (connEvt != null && (connEvt[3] & 0xFF) == 0) {
+                        int h = u16le(connEvt, 4) & 0x0FFF;
+                        sendDisconnectCmd(h);
+                    }
+                    session.emitForConn(mac, "CONN_STATE DISCONNECTED " + mac + " status=0 reason=CANCELED");
+                    return;
                 }
-                lastStatus = 133; // Timeout
+
+                if (connEvt == null || (connEvt[3] & 0xFF) != 0) {
+                    session.emitForConn(mac, "CONN_STATE DISCONNECTED " + mac
+                            + " status=" + lastStatus + " reason=CONNECT_TIMEOUT");
+                    return;
+                }
+
+                int handle = u16le(connEvt, 4) & 0x0FFF;
+                established = new LeConnection(handle, mac, session, session.defaultServerMtu);
+                String resolvedFilter = resolveServiceFilter(session, explicitServiceFilter);
+                if (!session.genericDefault && "fff0".equals(resolvedFilter)) {
+                    established.protectedWriteUuids.add("fff1");
+                }
+
+                synchronized (hciLock) {
+                    connectionsByHandle.put(Integer.valueOf(handle), established);
+                    connectionsByMac.put(mac, established);
+                }
+                synchronized (session.ownedByMac) {
+                    session.ownedByMac.put(mac, established);
+                    session.primaryMac = mac;
+                }
+                transport.setFilterState(true, handle);
+
+                if (mod != null) {
+                    mod.log("BLE connected to " + mac + " handle=0x" + Integer.toHexString(handle)
+                            + " session=" + session.sessionId + " filter=" + resolvedFilter);
+                }
+                session.emitForConn(mac, String.format(Locale.US, "CONN_STATE DISCOVERING %s handle=0x%04x",
+                        mac, Integer.valueOf(handle)));
+            } finally {
+                connectInProgress = false;
+                syncHardwareScanState(mod);
             }
         }
 
-        if (cancelConnectRequested) {
-            if (connEvt != null && (connEvt[3] & 0xFF) == 0) {
-                int h = u16le(connEvt, 4) & 0x0FFF;
-                sendDisconnectCmd(h);
-            }
-            transport.setFilterState(true, -1);
-            emitter.emitLine("CONN_STATE DISCONNECTED " + mac + " status=0 reason=CANCELED");
+        if (established == null || established.closed) {
             return;
         }
-
-        if (connEvt == null || (connEvt[3] & 0xFF) != 0) {
-            transport.setFilterState(true, -1);
-            emitter.emitLine("CONN_STATE DISCONNECTED " + mac + " status=" + lastStatus + " reason=CONNECT_TIMEOUT");
-            return;
-        }
-
-        int handle = u16le(connEvt, 4) & 0x0FFF;
-        synchronized (hciLock) {
-            activeConnHandle = handle;
-            activeConnMac = mac;
-            inflightLeAclPkts = 0;
-            l2capReassembly = null;
-            l2capExpectedLen = 0;
-        }
-        transport.setFilterState(true, handle);
-
-        if (mod != null) {
-            mod.log("BLE connected to " + mac + " handle=0x" + Integer.toHexString(handle));
-        }
-        emitter.emitLine(String.format(Locale.US, "CONN_STATE DISCOVERING %s handle=0x%04x",
-                mac, Integer.valueOf(handle)));
 
         // Brief settle window before ATT service discovery (matches KitKat Broadcom peripheral timing)
         sleepQuietly(150L);
-        if (activeConnHandle != handle) {
+        if (established.closed) {
             return;
         }
 
-        discoverBvm02GattTable(mac, emitter);
+        String resolvedFilter = resolveServiceFilter(session, explicitServiceFilter);
+        discoverGattTable(established, resolvedFilter);
     }
 
-    private void disconnectActiveLink(LineEmitter emitter, String reason) {
-        int h;
-        String prevMac;
+    private static String resolveServiceFilter(ClientSession session, String explicitFilter) {
+        if (explicitFilter != null && !explicitFilter.trim().isEmpty()) {
+            String f = explicitFilter.trim().toLowerCase(Locale.US);
+            if ("*".equals(f) || "all".equals(f)) {
+                return "*";
+            }
+            return normalizeUuidKey(f);
+        }
+        return session.genericDefault ? "*" : "fff0";
+    }
+
+    private void disconnectAllSessionLinks(ClientSession session, boolean emitEvent, String reason) {
+        List<LeConnection> list;
+        synchronized (session.ownedByMac) {
+            list = new ArrayList<LeConnection>(session.ownedByMac.values());
+        }
+        for (int i = 0; i < list.size(); i++) {
+            disconnectConnection(list.get(i), emitEvent, reason);
+        }
+    }
+
+    private void disconnectConnection(LeConnection conn, boolean emitEvent, String reason) {
+        if (conn == null) return;
+        boolean wasOpen = false;
         synchronized (hciLock) {
-            h = activeConnHandle;
-            prevMac = activeConnMac;
-            activeConnHandle = -1;
-            activeConnMac = "";
-            inflightLeAclPkts = 0;
-            l2capReassembly = null;
-            l2capExpectedLen = 0;
-            hciLock.notifyAll();
+            if (!conn.closed) {
+                conn.closed = true;
+                wasOpen = true;
+                connectionsByHandle.remove(Integer.valueOf(conn.handle));
+                if (connectionsByMac.get(conn.mac) == conn) {
+                    connectionsByMac.remove(conn.mac);
+                }
+                conn.l2capReassembly = null;
+                conn.l2capExpectedLen = 0;
+                if (connectionsByHandle.isEmpty()) {
+                    inflightLeAclPkts = 0;
+                }
+                hciLock.notifyAll();
+            }
         }
-        synchronized (attLock) {
-            charByUuid.clear();
-            charByValHandle.clear();
-            attLock.notifyAll();
+        synchronized (conn.owner.ownedByMac) {
+            if (conn.owner.ownedByMac.get(conn.mac) == conn) {
+                conn.owner.ownedByMac.remove(conn.mac);
+            }
         }
-        if (h >= 0 && h <= 0x0EFF) {
-            // Keep C filter active briefly so Disconnection_Complete (0x05) is consumed cleanly
-            sendDisconnectCmd(h);
+        refreshSessionPrimaryMac(conn.owner);
+
+        synchronized (conn.attLock) {
+            conn.charByUuid.clear();
+            conn.charByValHandle.clear();
+            conn.attLock.notifyAll();
+        }
+
+        if (wasOpen && conn.handle >= 0 && conn.handle <= 0x0EFF) {
+            // Keep C filter tracking briefly so Disconnection_Complete (0x05) is consumed cleanly
+            sendDisconnectCmd(conn.handle);
             sleepQuietly(180L);
+            transport.setFilterState(true, BtNativeBridge.encodeUntrackHandle(conn.handle));
         }
-        transport.setFilterState(true, -1);
-        if (emitter != null && prevMac != null && !prevMac.isEmpty()) {
-            emitter.emitLine("CONN_STATE DISCONNECTED " + prevMac + " status=0 reason="
+
+        if (emitEvent && wasOpen) {
+            conn.owner.emitForConn(conn.mac, "CONN_STATE DISCONNECTED " + conn.mac + " status=0 reason="
                     + (reason != null ? reason : "DISCONNECTED"));
         }
     }
@@ -623,42 +1070,31 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
         sendHciCmdSync(HCI_DISCONNECT, discParams, 800L);
     }
 
-    private void cleanupSessionHardwareState() {
-        stopBleScan(null);
-        disconnectActiveLink(null, null);
-    }
-
-    private void closeActiveSocketStreamQuietly() {
-        OutputStream prev = activeSessionSocketOut;
-        if (prev != null) {
-            try { prev.close(); } catch (Throwable ignored) {}
-        }
-    }
-
     // ================= ATT / GATT CENTRAL DISCOVERY & OPERATIONS =================
 
-    public boolean discoverBvm02GattTable(String mac, LineEmitter emitter) {
-        synchronized (attLock) {
-            charByUuid.clear();
-            charByValHandle.clear();
+    private boolean discoverGattTable(LeConnection conn, String serviceFilter) {
+        synchronized (conn.attLock) {
+            conn.charByUuid.clear();
+            conn.charByValHandle.clear();
         }
 
-        int fff0Start = 0;
-        int fff0End = 0;
+        boolean wildcard = "*".equals(serviceFilter);
+        int targetSvcStart = 0;
+        int targetSvcEnd = 0;
 
         // 1. Discover Primary Services (UUID 0x2800) via ATT_READ_BY_GROUP_TYPE_REQ (0x10)
         int curStart = 0x0001;
         int guard = 0;
-        while (curStart <= 0xFFFF && guard++ < 32) {
+        while (curStart <= 0xFFFF && guard++ < 48) {
             byte[] req = new byte[]{
                     (byte) ATT_READ_BY_GROUP_TYPE_REQ,
                     (byte) (curStart & 0xFF), (byte) ((curStart >> 8) & 0xFF),
                     (byte) 0xFF, (byte) 0xFF,
                     0x00, 0x28
             };
-            byte[] rsp = transactAtt(req, 3000L);
+            byte[] rsp = transactAtt(conn, req, 3000L);
             if (rsp == null) {
-                disconnectActiveLink(emitter, "ATT_SVC_DISCOVERY_TIMEOUT");
+                disconnectConnection(conn, true, "ATT_SVC_DISCOVERY_TIMEOUT");
                 return false;
             }
             int op = rsp[0] & 0xFF;
@@ -677,11 +1113,11 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
                 int sHandle = u16le(rsp, pos);
                 int eHandle = u16le(rsp, pos + 2);
                 String svcUuid = decodeAttUuid(rsp, pos + 4, itemLen - 4);
-                emitter.emitLine(String.format(Locale.US, "GATT_SVC %s %04x %04x",
+                conn.owner.emitForConn(conn.mac, String.format(Locale.US, "GATT_SVC %s %04x %04x",
                         svcUuid, Integer.valueOf(sHandle), Integer.valueOf(eHandle)));
-                if ("fff0".equals(svcUuid)) {
-                    fff0Start = sHandle;
-                    fff0End = eHandle;
+                if (!wildcard && serviceFilter.equals(svcUuid)) {
+                    targetSvcStart = sHandle;
+                    targetSvcEnd = eHandle;
                 }
                 if (eHandle > lastEnd) {
                     lastEnd = eHandle;
@@ -693,23 +1129,25 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
             curStart = lastEnd + 1;
         }
 
-        int searchStart = (fff0Start > 0 && fff0End >= fff0Start) ? fff0Start : 0x0001;
-        int searchEnd = (fff0Start > 0 && fff0End >= fff0Start) ? fff0End : 0xFFFF;
+        int searchStart = (!wildcard && targetSvcStart > 0 && targetSvcEnd >= targetSvcStart)
+                ? targetSvcStart : 0x0001;
+        int searchEnd = (!wildcard && targetSvcStart > 0 && targetSvcEnd >= targetSvcStart)
+                ? targetSvcEnd : 0xFFFF;
 
         // 2. Discover Characteristics (UUID 0x2803) via ATT_READ_BY_TYPE_REQ (0x08)
         List<DiscoveredChar> discovered = new ArrayList<DiscoveredChar>();
         curStart = searchStart;
         guard = 0;
-        while (curStart <= searchEnd && guard++ < 48) {
+        while (curStart <= searchEnd && guard++ < 128) {
             byte[] req = new byte[]{
                     (byte) ATT_READ_BY_TYPE_REQ,
                     (byte) (curStart & 0xFF), (byte) ((curStart >> 8) & 0xFF),
                     (byte) (searchEnd & 0xFF), (byte) ((searchEnd >> 8) & 0xFF),
                     0x03, 0x28
             };
-            byte[] rsp = transactAtt(req, 3000L);
+            byte[] rsp = transactAtt(conn, req, 3000L);
             if (rsp == null) {
-                disconnectActiveLink(emitter, "ATT_CHAR_DISCOVERY_TIMEOUT");
+                disconnectConnection(conn, true, "ATT_CHAR_DISCOVERY_TIMEOUT");
                 return false;
             }
             int op = rsp[0] & 0xFF;
@@ -746,75 +1184,114 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
             c.endHandle = (i + 1 < discovered.size())
                     ? Math.max(c.valHandle, discovered.get(i + 1).declHandle - 1)
                     : Math.max(c.valHandle, searchEnd);
-            synchronized (attLock) {
-                charByUuid.put(c.shortUuid, c);
-                charByValHandle.put(Integer.valueOf(c.valHandle), c);
+            synchronized (conn.attLock) {
+                conn.charByUuid.put(c.shortUuid, c);
+                conn.charByValHandle.put(Integer.valueOf(c.valHandle), c);
             }
-            emitter.emitLine(String.format(Locale.US, "GATT_CHAR %s %02x %04x %04x",
+            conn.owner.emitForConn(conn.mac, String.format(Locale.US, "GATT_CHAR %s %02x %04x %04x",
                     c.shortUuid, Integer.valueOf(c.props),
                     Integer.valueOf(c.valHandle), Integer.valueOf(c.endHandle)));
         }
 
-        boolean hasBvm02Chars;
+        boolean serviceSatisfied;
         StringBuilder specCsv = new StringBuilder();
-        synchronized (attLock) {
-            hasBvm02Chars = (fff0Start > 0)
-                    || charByUuid.containsKey("fff2")
-                    || charByUuid.containsKey("fff4")
-                    || charByUuid.containsKey("fff1");
-            for (DiscoveredChar c : charByUuid.values()) {
+        synchronized (conn.attLock) {
+            if (wildcard) {
+                serviceSatisfied = true;
+            } else if ("fff0".equals(serviceFilter)) {
+                serviceSatisfied = (targetSvcStart > 0)
+                        || conn.charByUuid.containsKey("fff2")
+                        || conn.charByUuid.containsKey("fff4")
+                        || conn.charByUuid.containsKey("fff1");
+            } else {
+                serviceSatisfied = (targetSvcStart > 0) || conn.charByUuid.containsKey(serviceFilter);
+            }
+            for (DiscoveredChar c : conn.charByUuid.values()) {
                 if (specCsv.length() > 0) specCsv.append(',');
-                specCsv.append(c.shortUuid).append(':').append(String.format(Locale.US, "%02x", Integer.valueOf(c.props)));
+                specCsv.append(c.shortUuid)
+                        .append(':')
+                        .append(String.format(Locale.US, "%02x", Integer.valueOf(c.props)));
             }
         }
 
-        if (!hasBvm02Chars) {
-            disconnectActiveLink(emitter, "MISSING_SERVICE_FFF0");
+        if (!serviceSatisfied) {
+            String reason = "fff0".equals(serviceFilter)
+                    ? "MISSING_SERVICE_FFF0"
+                    : ("MISSING_SERVICE_" + serviceFilter.toUpperCase(Locale.US));
+            disconnectConnection(conn, true, reason);
             return false;
         }
 
-        emitter.emitLine("GATT_READY " + mac + " " + (specCsv.length() > 0 ? specCsv.toString() : "none"));
+        conn.owner.emitForConn(conn.mac,
+                "GATT_READY " + conn.mac + " " + (specCsv.length() > 0 ? specCsv.toString() : "none"));
         return true;
     }
 
-    public void handleEnableNotify(String shortUuid, LineEmitter emitter) {
+    private void handleRequestMtu(ClientSession session, String explicitMac, int desiredMtu) {
+        LeConnection conn = resolveSessionConnection(session, explicitMac);
+        if (conn == null || conn.closed) {
+            session.emitForConn(explicitMac, "OP_ERR REQUEST_MTU NOT_CONNECTED");
+            return;
+        }
+        int clamped = clampMtu(desiredMtu);
+        conn.preferredServerMtu = clamped;
+        byte[] req = new byte[]{
+                (byte) ATT_EXCHANGE_MTU_REQ,
+                (byte) (clamped & 0xFF),
+                (byte) ((clamped >> 8) & 0xFF)
+        };
+        byte[] rsp = transactAtt(conn, req, 2500L);
+        if (rsp == null) {
+            session.emitForConn(conn.mac, "OP_ERR REQUEST_MTU TIMEOUT");
+            return;
+        }
+        int op = rsp[0] & 0xFF;
+        if (op == ATT_EXCHANGE_MTU_RSP && rsp.length >= 3) {
+            int serverRxMtu = u16le(rsp, 1);
+            int effective = Math.max(DEFAULT_ATT_MTU, Math.min(clamped, serverRxMtu));
+            conn.attMtu = effective;
+            session.emitForConn(conn.mac, "OP_OK REQUEST_MTU " + effective);
+        } else if (op == ATT_ERROR_RSP && rsp.length >= 5) {
+            conn.attMtu = DEFAULT_ATT_MTU;
+            session.emitForConn(conn.mac, "OP_ERR REQUEST_MTU ATT_ERR_0x"
+                    + Integer.toHexString(rsp[4] & 0xFF));
+        } else {
+            session.emitForConn(conn.mac, "OP_ERR REQUEST_MTU UNEXPECTED_RSP");
+        }
+    }
+
+    private void handleProtectChar(ClientSession session, String explicitMac, String uuid) {
+        LeConnection conn = resolveSessionConnection(session, explicitMac);
+        if (conn == null || conn.closed) {
+            session.emitForConn(explicitMac, "OP_ERR PROTECT_CHAR " + uuid + " NOT_CONNECTED");
+            return;
+        }
+        synchronized (conn.attLock) {
+            conn.protectedWriteUuids.add(uuid);
+        }
+        session.emitForConn(conn.mac, "OP_OK PROTECT_CHAR " + uuid);
+    }
+
+    private void handleEnableNotify(ClientSession session, String explicitMac, String shortUuid) {
+        LeConnection conn = resolveSessionConnection(session, explicitMac);
+        if (conn == null || conn.closed) {
+            session.emitForConn(explicitMac, "OP_ERR ENABLE_NOTIFY " + shortUuid + " NOT_CONNECTED");
+            return;
+        }
         DiscoveredChar ch;
-        synchronized (attLock) {
-            ch = charByUuid.get(shortUuid);
+        synchronized (conn.attLock) {
+            ch = conn.charByUuid.get(shortUuid);
         }
         if (ch == null) {
-            emitter.emitLine("OP_ERR ENABLE_NOTIFY " + shortUuid + " CHAR_NOT_FOUND");
+            session.emitForConn(conn.mac, "OP_ERR ENABLE_NOTIFY " + shortUuid + " CHAR_NOT_FOUND");
             return;
         }
 
-        if (ch.cccdHandle == 0 && ch.valHandle < ch.endHandle) {
-            int startH = ch.valHandle + 1;
-            int endH = Math.min(ch.endHandle, ch.valHandle + 6);
-            byte[] findReq = new byte[]{
-                    (byte) ATT_FIND_INFO_REQ,
-                    (byte) (startH & 0xFF), (byte) ((startH >> 8) & 0xFF),
-                    (byte) (endH & 0xFF), (byte) ((endH >> 8) & 0xFF)
-            };
-            byte[] findRsp = transactAtt(findReq, 2500L);
-            if (findRsp != null && (findRsp[0] & 0xFF) == ATT_FIND_INFO_RSP && findRsp.length >= 6) {
-                int fmt = findRsp[1] & 0xFF;
-                int pairLen = (fmt == 1) ? 4 : ((fmt == 2) ? 18 : 0);
-                if (pairLen > 0) {
-                    for (int pos = 2; pos + pairLen <= findRsp.length; pos += pairLen) {
-                        int descHandle = u16le(findRsp, pos);
-                        String descUuid = decodeAttUuid(findRsp, pos + 2, pairLen - 2);
-                        if ("2902".equals(descUuid)) {
-                            ch.cccdHandle = descHandle;
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+        ensureCccdDiscovered(conn, ch);
 
         if (ch.cccdHandle == 0) {
-            // Peripheral exposes notify without separate 0x2902 descriptor handle
-            emitter.emitLine("OP_OK ENABLE_NOTIFY " + shortUuid);
+            ch.notifySubscribed = true;
+            session.emitForConn(conn.mac, "OP_OK ENABLE_NOTIFY " + shortUuid);
             return;
         }
 
@@ -826,21 +1303,93 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
                 (byte) (indicateOnly ? 0x02 : 0x01),
                 0x00
         };
-        byte[] rsp = transactAtt(writeCccd, 2500L);
+        byte[] rsp = transactAtt(conn, writeCccd, 2500L);
         if (rsp != null && (rsp[0] & 0xFF) == ATT_WRITE_RSP) {
-            emitter.emitLine("OP_OK ENABLE_NOTIFY " + shortUuid);
+            ch.notifySubscribed = true;
+            session.emitForConn(conn.mac, "OP_OK ENABLE_NOTIFY " + shortUuid);
         } else {
-            emitter.emitLine("OP_ERR ENABLE_NOTIFY " + shortUuid + " CCCD_WRITE_FAILED");
+            session.emitForConn(conn.mac, "OP_ERR ENABLE_NOTIFY " + shortUuid + " CCCD_WRITE_FAILED");
         }
     }
 
-    public void handleReadChar(String shortUuid, LineEmitter emitter) {
+    private void handleDisableNotify(ClientSession session, String explicitMac, String shortUuid) {
+        LeConnection conn = resolveSessionConnection(session, explicitMac);
+        if (conn == null || conn.closed) {
+            session.emitForConn(explicitMac, "OP_ERR DISABLE_NOTIFY " + shortUuid + " NOT_CONNECTED");
+            return;
+        }
         DiscoveredChar ch;
-        synchronized (attLock) {
-            ch = charByUuid.get(shortUuid);
+        synchronized (conn.attLock) {
+            ch = conn.charByUuid.get(shortUuid);
         }
         if (ch == null) {
-            emitter.emitLine("OP_ERR READ_CHAR " + shortUuid + " CHAR_NOT_FOUND");
+            session.emitForConn(conn.mac, "OP_ERR DISABLE_NOTIFY " + shortUuid + " CHAR_NOT_FOUND");
+            return;
+        }
+
+        ensureCccdDiscovered(conn, ch);
+        ch.notifySubscribed = false;
+
+        if (ch.cccdHandle == 0) {
+            session.emitForConn(conn.mac, "OP_OK DISABLE_NOTIFY " + shortUuid);
+            return;
+        }
+
+        byte[] writeCccd = new byte[]{
+                (byte) ATT_WRITE_REQ,
+                (byte) (ch.cccdHandle & 0xFF),
+                (byte) ((ch.cccdHandle >> 8) & 0xFF),
+                0x00,
+                0x00
+        };
+        byte[] rsp = transactAtt(conn, writeCccd, 2500L);
+        if (rsp != null && (rsp[0] & 0xFF) == ATT_WRITE_RSP) {
+            session.emitForConn(conn.mac, "OP_OK DISABLE_NOTIFY " + shortUuid);
+        } else {
+            session.emitForConn(conn.mac, "OP_ERR DISABLE_NOTIFY " + shortUuid + " CCCD_WRITE_FAILED");
+        }
+    }
+
+    private void ensureCccdDiscovered(LeConnection conn, DiscoveredChar ch) {
+        if (ch.cccdHandle != 0 || ch.valHandle >= ch.endHandle) {
+            return;
+        }
+        int startH = ch.valHandle + 1;
+        int endH = Math.min(ch.endHandle, ch.valHandle + 6);
+        byte[] findReq = new byte[]{
+                (byte) ATT_FIND_INFO_REQ,
+                (byte) (startH & 0xFF), (byte) ((startH >> 8) & 0xFF),
+                (byte) (endH & 0xFF), (byte) ((endH >> 8) & 0xFF)
+        };
+        byte[] findRsp = transactAtt(conn, findReq, 2500L);
+        if (findRsp != null && (findRsp[0] & 0xFF) == ATT_FIND_INFO_RSP && findRsp.length >= 6) {
+            int fmt = findRsp[1] & 0xFF;
+            int pairLen = (fmt == 1) ? 4 : ((fmt == 2) ? 18 : 0);
+            if (pairLen > 0) {
+                for (int pos = 2; pos + pairLen <= findRsp.length; pos += pairLen) {
+                    int descHandle = u16le(findRsp, pos);
+                    String descUuid = decodeAttUuid(findRsp, pos + 2, pairLen - 2);
+                    if ("2902".equals(descUuid)) {
+                        ch.cccdHandle = descHandle;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    private void handleReadChar(ClientSession session, String explicitMac, String shortUuid) {
+        LeConnection conn = resolveSessionConnection(session, explicitMac);
+        if (conn == null || conn.closed) {
+            session.emitForConn(explicitMac, "OP_ERR READ_CHAR " + shortUuid + " NOT_CONNECTED");
+            return;
+        }
+        DiscoveredChar ch;
+        synchronized (conn.attLock) {
+            ch = conn.charByUuid.get(shortUuid);
+        }
+        if (ch == null) {
+            session.emitForConn(conn.mac, "OP_ERR READ_CHAR " + shortUuid + " CHAR_NOT_FOUND");
             return;
         }
         byte[] req = new byte[]{
@@ -848,9 +1397,9 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
                 (byte) (ch.valHandle & 0xFF),
                 (byte) ((ch.valHandle >> 8) & 0xFF)
         };
-        byte[] rsp = transactAtt(req, 2500L);
+        byte[] rsp = transactAtt(conn, req, 2500L);
         if (rsp == null) {
-            emitter.emitLine("OP_ERR READ_CHAR " + shortUuid + " TIMEOUT");
+            session.emitForConn(conn.mac, "OP_ERR READ_CHAR " + shortUuid + " TIMEOUT");
             return;
         }
         int op = rsp[0] & 0xFF;
@@ -859,91 +1408,256 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
             if (val.length > 0) {
                 System.arraycopy(rsp, 1, val, 0, val.length);
             }
-            emitter.emitLine("OP_OK READ_CHAR " + shortUuid + " " + (val.length > 0 ? bytesToHex(val) : "-"));
+            session.emitForConn(conn.mac,
+                    "OP_OK READ_CHAR " + shortUuid + " " + (val.length > 0 ? bytesToHex(val) : "-"));
         } else if (op == ATT_ERROR_RSP && rsp.length >= 5) {
-            emitter.emitLine("OP_ERR READ_CHAR " + shortUuid + " ATT_ERR_0x"
+            session.emitForConn(conn.mac, "OP_ERR READ_CHAR " + shortUuid + " ATT_ERR_0x"
                     + Integer.toHexString(rsp[4] & 0xFF));
         } else {
-            emitter.emitLine("OP_ERR READ_CHAR " + shortUuid + " UNEXPECTED_RSP");
+            session.emitForConn(conn.mac, "OP_ERR READ_CHAR " + shortUuid + " UNEXPECTED_RSP");
         }
     }
 
-    public void handleWriteChar(String shortUuid, byte[] payload, LineEmitter emitter) {
-        if ("fff1".equals(shortUuid)) {
-            emitter.emitLine("OP_ERR WRITE_CHAR fff1 FORBIDDEN_READ_ONLY_FFF1");
+    private void handleReadBlob(ClientSession session, String explicitMac, String shortUuid, int offset) {
+        LeConnection conn = resolveSessionConnection(session, explicitMac);
+        if (conn == null || conn.closed) {
+            session.emitForConn(explicitMac, "OP_ERR READ_BLOB " + shortUuid + " NOT_CONNECTED");
             return;
         }
-        if (payload == null) {
-            emitter.emitLine("OP_ERR WRITE_CHAR " + shortUuid + " INVALID_HEX");
+        if (offset < 0 || offset > 0xFFFF) {
+            session.emitForConn(conn.mac, "OP_ERR READ_BLOB " + shortUuid + " INVALID_OFFSET");
             return;
         }
         DiscoveredChar ch;
-        synchronized (attLock) {
-            ch = charByUuid.get(shortUuid);
+        synchronized (conn.attLock) {
+            ch = conn.charByUuid.get(shortUuid);
         }
         if (ch == null) {
-            emitter.emitLine("OP_ERR WRITE_CHAR " + shortUuid + " CHAR_NOT_FOUND");
+            session.emitForConn(conn.mac, "OP_ERR READ_BLOB " + shortUuid + " CHAR_NOT_FOUND");
+            return;
+        }
+        byte[] req = new byte[]{
+                (byte) ATT_READ_BLOB_REQ,
+                (byte) (ch.valHandle & 0xFF),
+                (byte) ((ch.valHandle >> 8) & 0xFF),
+                (byte) (offset & 0xFF),
+                (byte) ((offset >> 8) & 0xFF)
+        };
+        byte[] rsp = transactAtt(conn, req, 2500L);
+        if (rsp == null) {
+            session.emitForConn(conn.mac, "OP_ERR READ_BLOB " + shortUuid + " TIMEOUT");
+            return;
+        }
+        int op = rsp[0] & 0xFF;
+        if (op == ATT_READ_BLOB_RSP) {
+            byte[] val = new byte[rsp.length - 1];
+            if (val.length > 0) {
+                System.arraycopy(rsp, 1, val, 0, val.length);
+            }
+            session.emitForConn(conn.mac, "OP_OK READ_BLOB " + shortUuid + " " + offset + " "
+                    + (val.length > 0 ? bytesToHex(val) : "-"));
+        } else if (op == ATT_ERROR_RSP && rsp.length >= 5) {
+            session.emitForConn(conn.mac, "OP_ERR READ_BLOB " + shortUuid + " ATT_ERR_0x"
+                    + Integer.toHexString(rsp[4] & 0xFF));
+        } else {
+            session.emitForConn(conn.mac, "OP_ERR READ_BLOB " + shortUuid + " UNEXPECTED_RSP");
+        }
+    }
+
+    private void handleReadLongChar(ClientSession session, String explicitMac, String shortUuid) {
+        LeConnection conn = resolveSessionConnection(session, explicitMac);
+        if (conn == null || conn.closed) {
+            session.emitForConn(explicitMac, "OP_ERR READ_LONG_CHAR " + shortUuid + " NOT_CONNECTED");
+            return;
+        }
+        DiscoveredChar ch;
+        synchronized (conn.attLock) {
+            ch = conn.charByUuid.get(shortUuid);
+        }
+        if (ch == null) {
+            session.emitForConn(conn.mac, "OP_ERR READ_LONG_CHAR " + shortUuid + " CHAR_NOT_FOUND");
             return;
         }
 
-        // Default ATT MTU is 23 bytes -> max 20-byte attribute value payload
-        int len = Math.min(payload.length, 20);
-        boolean useWriteReq = ((ch.props & 0x08) != 0) || ((ch.props & 0x04) == 0);
+        byte[] firstReq = new byte[]{
+                (byte) ATT_READ_REQ,
+                (byte) (ch.valHandle & 0xFF),
+                (byte) ((ch.valHandle >> 8) & 0xFF)
+        };
+        byte[] rsp = transactAtt(conn, firstReq, 2500L);
+        if (rsp == null) {
+            session.emitForConn(conn.mac, "OP_ERR READ_LONG_CHAR " + shortUuid + " TIMEOUT");
+            return;
+        }
+        int op = rsp[0] & 0xFF;
+        if (op == ATT_ERROR_RSP && rsp.length >= 5) {
+            session.emitForConn(conn.mac, "OP_ERR READ_LONG_CHAR " + shortUuid + " ATT_ERR_0x"
+                    + Integer.toHexString(rsp[4] & 0xFF));
+            return;
+        }
+        if (op != ATT_READ_RSP) {
+            session.emitForConn(conn.mac, "OP_ERR READ_LONG_CHAR " + shortUuid + " UNEXPECTED_RSP");
+            return;
+        }
+
+        ByteArrayOutputStream acc = new ByteArrayOutputStream(128);
+        int chunkLen = rsp.length - 1;
+        if (chunkLen > 0) {
+            acc.write(rsp, 1, chunkLen);
+        }
+
+        int expectedFullChunk = Math.max(22, conn.attMtu - 1);
+        int guard = 0;
+        while (chunkLen >= expectedFullChunk && acc.size() < 512 && guard++ < 32) {
+            int offset = acc.size();
+            byte[] blobReq = new byte[]{
+                    (byte) ATT_READ_BLOB_REQ,
+                    (byte) (ch.valHandle & 0xFF),
+                    (byte) ((ch.valHandle >> 8) & 0xFF),
+                    (byte) (offset & 0xFF),
+                    (byte) ((offset >> 8) & 0xFF)
+            };
+            byte[] blobRsp = transactAtt(conn, blobReq, 2500L);
+            if (blobRsp == null) {
+                session.emitForConn(conn.mac, "OP_ERR READ_LONG_CHAR " + shortUuid + " TIMEOUT");
+                return;
+            }
+            int bop = blobRsp[0] & 0xFF;
+            if (bop == ATT_ERROR_RSP && blobRsp.length >= 5) {
+                int attErr = blobRsp[4] & 0xFF;
+                // 0x0B = Attribute Not Long, 0x07 = Invalid Offset -> return accumulated bytes cleanly
+                if (attErr == 0x0B || attErr == 0x07) {
+                    break;
+                }
+                session.emitForConn(conn.mac, "OP_ERR READ_LONG_CHAR " + shortUuid + " ATT_ERR_0x"
+                        + Integer.toHexString(attErr));
+                return;
+            }
+            if (bop != ATT_READ_BLOB_RSP) {
+                break;
+            }
+            chunkLen = blobRsp.length - 1;
+            if (chunkLen > 0) {
+                int copy = Math.min(chunkLen, 512 - acc.size());
+                acc.write(blobRsp, 1, copy);
+            }
+            expectedFullChunk = Math.max(22, conn.attMtu - 1);
+        }
+
+        byte[] fullVal = acc.toByteArray();
+        session.emitForConn(conn.mac, "OP_OK READ_LONG_CHAR " + shortUuid + " "
+                + (fullVal.length > 0 ? bytesToHex(fullVal) : "-"));
+    }
+
+    private void handleWriteChar(
+            ClientSession session,
+            String explicitMac,
+            String shortUuid,
+            byte[] payload,
+            boolean preferNoResponse) {
+        String opName = preferNoResponse ? "WRITE_CHAR_NR" : "WRITE_CHAR";
+        LeConnection conn = resolveSessionConnection(session, explicitMac);
+        if (conn == null || conn.closed) {
+            session.emitForConn(explicitMac, "OP_ERR " + opName + " " + shortUuid + " NOT_CONNECTED");
+            return;
+        }
+        boolean isProtected;
+        synchronized (conn.attLock) {
+            isProtected = conn.protectedWriteUuids.contains(shortUuid);
+        }
+        if (isProtected) {
+            String reason = "fff1".equals(shortUuid)
+                    ? "FORBIDDEN_READ_ONLY_FFF1"
+                    : ("PROTECTED_CHAR_" + shortUuid.toUpperCase(Locale.US));
+            session.emitForConn(conn.mac, "OP_ERR " + opName + " " + shortUuid + " " + reason);
+            return;
+        }
+        if (payload == null) {
+            session.emitForConn(conn.mac, "OP_ERR " + opName + " " + shortUuid + " INVALID_HEX");
+            return;
+        }
+        DiscoveredChar ch;
+        synchronized (conn.attLock) {
+            ch = conn.charByUuid.get(shortUuid);
+        }
+        if (ch == null) {
+            session.emitForConn(conn.mac, "OP_ERR " + opName + " " + shortUuid + " CHAR_NOT_FOUND");
+            return;
+        }
+
+        int maxPayload = Math.max(20, conn.attMtu - 3);
+        int len = Math.min(payload.length, maxPayload);
+        boolean canWriteReq = (ch.props & 0x08) != 0;
+        boolean canWriteCmd = (ch.props & 0x04) != 0;
+        boolean useWriteReq;
+        if (preferNoResponse) {
+            useWriteReq = !canWriteCmd && canWriteReq;
+        } else {
+            useWriteReq = canWriteReq || !canWriteCmd;
+        }
+
         byte[] pdu = new byte[3 + len];
         pdu[0] = (byte) (useWriteReq ? ATT_WRITE_REQ : ATT_WRITE_CMD);
         pdu[1] = (byte) (ch.valHandle & 0xFF);
         pdu[2] = (byte) ((ch.valHandle >> 8) & 0xFF);
-        System.arraycopy(payload, 0, pdu, 3, len);
+        if (len > 0) {
+            System.arraycopy(payload, 0, pdu, 3, len);
+        }
 
         if (!useWriteReq) {
-            boolean ok = sendL2capPdu(L2CAP_CID_ATT, pdu, 2000L);
-            emitter.emitLine(ok ? ("OP_OK WRITE_CHAR " + shortUuid)
-                    : ("OP_ERR WRITE_CHAR " + shortUuid + " ACL_TX_FAILED"));
+            boolean ok = sendL2capPdu(conn.handle, L2CAP_CID_ATT, pdu, 2500L);
+            session.emitForConn(conn.mac, ok
+                    ? ("OP_OK " + opName + " " + shortUuid)
+                    : ("OP_ERR " + opName + " " + shortUuid + " ACL_TX_FAILED"));
             return;
         }
 
-        byte[] rsp = transactAtt(pdu, 2500L);
+        byte[] rsp = transactAtt(conn, pdu, 3000L);
         if (rsp != null && (rsp[0] & 0xFF) == ATT_WRITE_RSP) {
-            emitter.emitLine("OP_OK WRITE_CHAR " + shortUuid);
+            session.emitForConn(conn.mac, "OP_OK " + opName + " " + shortUuid);
         } else if (rsp != null && (rsp[0] & 0xFF) == ATT_ERROR_RSP && rsp.length >= 5) {
-            emitter.emitLine("OP_ERR WRITE_CHAR " + shortUuid + " ATT_ERR_0x"
+            session.emitForConn(conn.mac, "OP_ERR " + opName + " " + shortUuid + " ATT_ERR_0x"
                     + Integer.toHexString(rsp[4] & 0xFF));
         } else {
-            emitter.emitLine("OP_ERR WRITE_CHAR " + shortUuid + " TIMEOUT");
+            session.emitForConn(conn.mac, "OP_ERR " + opName + " " + shortUuid + " TIMEOUT");
         }
     }
 
-    private byte[] transactAtt(byte[] attReq, long timeoutMs) {
-        synchronized (attLock) {
-            if (activeConnHandle < 0) return null;
-            pendingAttResponse = null;
-            attAwaitingResponse = true;
+    private byte[] transactAtt(LeConnection conn, byte[] attReq, long timeoutMs) {
+        if (conn == null || conn.closed) return null;
+        synchronized (conn.attLock) {
+            if (conn.closed) return null;
+            conn.pendingAttResponse = null;
+            conn.attAwaitingResponse = true;
         }
-        if (!sendL2capPdu(L2CAP_CID_ATT, attReq, timeoutMs)) {
-            synchronized (attLock) {
-                attAwaitingResponse = false;
+        if (!sendL2capPdu(conn.handle, L2CAP_CID_ATT, attReq, timeoutMs)) {
+            synchronized (conn.attLock) {
+                conn.attAwaitingResponse = false;
             }
             return null;
         }
         long deadline = System.currentTimeMillis() + timeoutMs;
-        synchronized (attLock) {
+        synchronized (conn.attLock) {
             try {
-                while (pendingAttResponse == null && activeConnHandle >= 0 && !cancelConnectRequested) {
+                while (conn.pendingAttResponse == null
+                        && !conn.closed
+                        && !conn.owner.cancelConnectRequested
+                        && conn.owner.active) {
                     long rem = deadline - System.currentTimeMillis();
                     if (rem <= 0L) break;
-                    attLock.wait(rem);
+                    conn.attLock.wait(rem);
                 }
-                return pendingAttResponse;
+                return conn.pendingAttResponse;
             } catch (InterruptedException ie) {
                 return null;
             } finally {
-                attAwaitingResponse = false;
-                pendingAttResponse = null;
+                conn.attAwaitingResponse = false;
+                conn.pendingAttResponse = null;
             }
         }
     }
 
-    // ================= HCI & L2CAP PACKET FRAMING / DISPATCH =================
+    // ================= HCI & L2CAP PACKET FRAMING / FRAGMENTATION / DISPATCH =================
 
     private byte[] sendHciCmdSync(int opcode, byte[] params, long timeoutMs) {
         byte[] pkt = buildHciCommandPacket(opcode, params);
@@ -1003,35 +1717,46 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
         }
     }
 
-    private boolean sendL2capPdu(int cid, byte[] l2capPayload, long creditWaitMs) {
-        int handle;
-        long deadline = System.currentTimeMillis() + creditWaitMs;
+    private boolean sendL2capPdu(int handle, int cid, byte[] l2capPayload, long creditWaitMs) {
+        if (handle < 0 || handle > 0x0EFF) {
+            return false;
+        }
+        int maxAclData;
         synchronized (hciLock) {
-            while (activeConnHandle >= 0 && inflightLeAclPkts >= maxLeAclCredits) {
-                long rem = deadline - System.currentTimeMillis();
-                if (rem <= 0L) break;
-                try {
-                    hciLock.wait(rem);
-                } catch (InterruptedException ie) {
+            maxAclData = controllerLeAclMaxLen;
+        }
+        List<byte[]> fragments = fragmentL2capIntoAclPackets(handle, cid, l2capPayload, maxAclData);
+        long deadline = System.currentTimeMillis() + creditWaitMs;
+
+        for (int i = 0; i < fragments.size(); i++) {
+            synchronized (hciLock) {
+                while (connectionsByHandle.containsKey(Integer.valueOf(handle))
+                        && inflightLeAclPkts >= maxLeAclCredits) {
+                    long rem = deadline - System.currentTimeMillis();
+                    if (rem <= 0L) return false;
+                    try {
+                        hciLock.wait(rem);
+                    } catch (InterruptedException ie) {
+                        return false;
+                    }
+                }
+                LeConnection conn = connectionsByHandle.get(Integer.valueOf(handle));
+                if (conn == null || conn.closed) {
                     return false;
                 }
+                inflightLeAclPkts++;
             }
-            handle = activeConnHandle;
-            if (handle < 0 || handle > 0x0EFF) {
+
+            boolean ok = transport.sendLeAcl(fragments.get(i));
+            if (!ok) {
+                synchronized (hciLock) {
+                    if (inflightLeAclPkts > 0) inflightLeAclPkts--;
+                    hciLock.notifyAll();
+                }
                 return false;
             }
-            inflightLeAclPkts++;
         }
-
-        byte[] acl = wrapLeAclL2cap(handle, cid, l2capPayload);
-        boolean ok = transport.sendLeAcl(acl);
-        if (!ok) {
-            synchronized (hciLock) {
-                if (inflightLeAclPkts > 0) inflightLeAclPkts--;
-                hciLock.notifyAll();
-            }
-        }
-        return ok;
+        return true;
     }
 
     @Override
@@ -1068,14 +1793,18 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
         if (evCode == 0x13 && ev.length >= 3) {
             int numH = ev[2] & 0xFF;
             synchronized (hciLock) {
-                if (activeConnHandle >= 0 && 3 + numH * 4 <= ev.length) {
+                if (!connectionsByHandle.isEmpty() && 3 + numH * 4 <= ev.length) {
+                    boolean changed = false;
                     for (int i = 0; i < numH; i++) {
                         int h = u16le(ev, 3 + i * 4) & 0x0FFF;
                         int completed = u16le(ev, 5 + i * 4);
-                        if (h == activeConnHandle && completed > 0) {
+                        if (completed > 0 && connectionsByHandle.containsKey(Integer.valueOf(h))) {
                             inflightLeAclPkts = Math.max(0, inflightLeAclPkts - completed);
-                            hciLock.notifyAll();
+                            changed = true;
                         }
+                    }
+                    if (changed) {
+                        hciLock.notifyAll();
                     }
                 }
             }
@@ -1087,30 +1816,40 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
             int st = ev[2] & 0xFF;
             int h = u16le(ev, 3) & 0x0FFF;
             int reason = ev[5] & 0xFF;
-            String droppedMac = null;
+            LeConnection dropped = null;
             synchronized (hciLock) {
-                if (st == 0 && h == activeConnHandle) {
-                    droppedMac = activeConnMac;
-                    activeConnHandle = -1;
-                    activeConnMac = "";
-                    inflightLeAclPkts = 0;
-                    l2capReassembly = null;
-                    hciLock.notifyAll();
+                if (st == 0) {
+                    dropped = connectionsByHandle.remove(Integer.valueOf(h));
+                    if (dropped != null) {
+                        dropped.closed = true;
+                        if (connectionsByMac.get(dropped.mac) == dropped) {
+                            connectionsByMac.remove(dropped.mac);
+                        }
+                        dropped.l2capReassembly = null;
+                        dropped.l2capExpectedLen = 0;
+                        if (connectionsByHandle.isEmpty()) {
+                            inflightLeAclPkts = 0;
+                        }
+                        hciLock.notifyAll();
+                    }
                 }
             }
-            if (droppedMac != null) {
-                transport.setFilterState(true, -1);
-                synchronized (attLock) {
-                    charByUuid.clear();
-                    charByValHandle.clear();
-                    attLock.notifyAll();
+            if (dropped != null) {
+                transport.setFilterState(true, BtNativeBridge.encodeUntrackHandle(h));
+                synchronized (dropped.owner.ownedByMac) {
+                    if (dropped.owner.ownedByMac.get(dropped.mac) == dropped) {
+                        dropped.owner.ownedByMac.remove(dropped.mac);
+                    }
                 }
-                LineEmitter em = activeEmitter;
-                if (em != null && !droppedMac.isEmpty()) {
-                    em.emitLine("CONN_STATE DISCONNECTED " + droppedMac
-                            + " status=" + reason + " reason=REMOTE_DISCONNECT_0x"
-                            + Integer.toHexString(reason));
+                refreshSessionPrimaryMac(dropped.owner);
+                synchronized (dropped.attLock) {
+                    dropped.charByUuid.clear();
+                    dropped.charByValHandle.clear();
+                    dropped.attLock.notifyAll();
                 }
+                dropped.owner.emitForConn(dropped.mac, "CONN_STATE DISCONNECTED " + dropped.mac
+                        + " status=" + reason + " reason=REMOTE_DISCONNECT_0x"
+                        + Integer.toHexString(reason));
             }
             return;
         }
@@ -1120,13 +1859,16 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
             int sub = ev[2] & 0xFF;
             if (sub == 0x02) { // LE_Advertising_Report
                 List<AdvReportItem> reports = parseLeAdvertisingReports(ev);
-                LineEmitter em = activeEmitter;
                 for (int i = 0; i < reports.size(); i++) {
                     AdvReportItem r = reports.get(i);
                     byte[] merged = updateAdvCacheAndMerge(r);
-                    if (scanning && em != null) {
-                        em.emitLine("ADV " + r.mac + " " + r.addrType + " " + r.rssi + " "
-                                + (merged.length > 0 ? bytesToHex(merged) : "-"));
+                    String advLine = "ADV " + r.mac + " " + r.addrType + " " + r.rssi + " "
+                            + (merged.length > 0 ? bytesToHex(merged) : "-");
+                    for (int sIdx = 0; sIdx < activeSessions.size(); sIdx++) {
+                        ClientSession s = activeSessions.get(sIdx);
+                        if (s.active && s.scanning) {
+                            s.emitRaw(advLine);
+                        }
                     }
                 }
             } else if ((sub == 0x01 && ev.length >= 19) || (sub == 0x0A && ev.length >= 19)) {
@@ -1149,11 +1891,13 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
         }
         if (aclLen <= 0) return;
 
+        LeConnection conn;
         int completedCid = -1;
         byte[] completedPdu = null;
 
         synchronized (hciLock) {
-            if (handle != activeConnHandle) return;
+            conn = connectionsByHandle.get(Integer.valueOf(handle));
+            if (conn == null || conn.closed) return;
 
             if (pbFlag == 0x02 || pbFlag == 0x00) {
                 if (aclLen < 4) return;
@@ -1164,34 +1908,37 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
                     completedCid = cid;
                     completedPdu = new byte[l2capLen];
                     System.arraycopy(acl, 8, completedPdu, 0, l2capLen);
-                    l2capReassembly = null;
-                    l2capExpectedLen = 0;
-                } else if (l2capLen <= 512) {
-                    l2capReassembly = new ByteArrayOutputStream(l2capLen);
-                    l2capReassembly.write(acl, 8, avail);
-                    l2capExpectedLen = l2capLen;
-                    l2capCurrentCid = cid;
+                    conn.l2capReassembly = null;
+                    conn.l2capExpectedLen = 0;
+                } else if (l2capLen <= MAX_REASSEMBLED_L2CAP_LEN) {
+                    conn.l2capReassembly = new ByteArrayOutputStream(l2capLen);
+                    conn.l2capReassembly.write(acl, 8, avail);
+                    conn.l2capExpectedLen = l2capLen;
+                    conn.l2capCurrentCid = cid;
+                } else {
+                    conn.l2capReassembly = null;
+                    conn.l2capExpectedLen = 0;
                 }
-            } else if (pbFlag == 0x01 && l2capReassembly != null) {
-                l2capReassembly.write(acl, 4, aclLen);
-                if (l2capReassembly.size() >= l2capExpectedLen) {
-                    byte[] full = l2capReassembly.toByteArray();
-                    completedCid = l2capCurrentCid;
-                    completedPdu = new byte[l2capExpectedLen];
-                    System.arraycopy(full, 0, completedPdu, 0, l2capExpectedLen);
-                    l2capReassembly = null;
-                    l2capExpectedLen = 0;
+            } else if (pbFlag == 0x01 && conn.l2capReassembly != null) {
+                conn.l2capReassembly.write(acl, 4, aclLen);
+                if (conn.l2capReassembly.size() >= conn.l2capExpectedLen) {
+                    byte[] full = conn.l2capReassembly.toByteArray();
+                    completedCid = conn.l2capCurrentCid;
+                    completedPdu = new byte[conn.l2capExpectedLen];
+                    System.arraycopy(full, 0, completedPdu, 0, conn.l2capExpectedLen);
+                    conn.l2capReassembly = null;
+                    conn.l2capExpectedLen = 0;
                 }
             }
         }
 
         if (completedPdu != null) {
-            handleCompleteL2capSdu(handle, completedCid, completedPdu);
+            handleCompleteL2capSdu(conn, completedCid, completedPdu);
         }
     }
 
-    private void handleCompleteL2capSdu(final int handle, int cid, byte[] pdu) {
-        if (pdu.length == 0) return;
+    private void handleCompleteL2capSdu(final LeConnection conn, int cid, byte[] pdu) {
+        if (conn == null || conn.closed || pdu.length == 0) return;
 
         if (cid == L2CAP_CID_LE_SIGNALING) {
             // L2CAP Connection Parameter Update Request (0x12) from peripheral
@@ -1204,11 +1951,11 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
 
                 // Accept (0x0000) on CID 0x0005
                 byte[] rsp = new byte[]{0x13, identifier, 0x02, 0x00, 0x00, 0x00};
-                sendL2capPdu(L2CAP_CID_LE_SIGNALING, rsp, 500L);
+                sendL2capPdu(conn.handle, L2CAP_CID_LE_SIGNALING, rsp, 500L);
 
                 if (minInt >= 6 && maxInt >= minInt && maxInt <= 3200 && timeout >= 10 && timeout <= 3200) {
                     byte[] upd = new byte[]{
-                            (byte) (handle & 0xFF), (byte) ((handle >> 8) & 0x0F),
+                            (byte) (conn.handle & 0xFF), (byte) ((conn.handle >> 8) & 0x0F),
                             (byte) (minInt & 0xFF), (byte) ((minInt >> 8) & 0xFF),
                             (byte) (maxInt & 0xFF), (byte) ((maxInt >> 8) & 0xFF),
                             (byte) (latency & 0xFF), (byte) ((latency >> 8) & 0xFF),
@@ -1226,48 +1973,58 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
         }
 
         int attOp = pdu[0] & 0xFF;
-        if (attOp == ATT_EXCHANGE_MTU_REQ) {
-            // Respond with standard 23-byte LE default MTU
-            sendL2capPdu(L2CAP_CID_ATT, new byte[]{(byte) ATT_EXCHANGE_MTU_RSP, 0x17, 0x00}, 500L);
+        if (attOp == ATT_EXCHANGE_MTU_REQ && pdu.length >= 3) {
+            int peerRxMtu = u16le(pdu, 1);
+            int ourMaxMtu = conn.preferredServerMtu;
+            conn.attMtu = Math.max(DEFAULT_ATT_MTU, Math.min(peerRxMtu, ourMaxMtu));
+            sendL2capPdu(conn.handle, L2CAP_CID_ATT, new byte[]{
+                    (byte) ATT_EXCHANGE_MTU_RSP,
+                    (byte) (ourMaxMtu & 0xFF),
+                    (byte) ((ourMaxMtu >> 8) & 0xFF)
+            }, 500L);
             return;
         }
 
         if (attOp == ATT_HANDLE_VALUE_NTF || attOp == ATT_HANDLE_VALUE_IND) {
             if (attOp == ATT_HANDLE_VALUE_IND) {
-                sendL2capPdu(L2CAP_CID_ATT, new byte[]{(byte) ATT_HANDLE_VALUE_CFM}, 500L);
+                sendL2capPdu(conn.handle, L2CAP_CID_ATT, new byte[]{(byte) ATT_HANDLE_VALUE_CFM}, 500L);
             }
             if (pdu.length >= 3) {
                 int valHandle = u16le(pdu, 1);
                 DiscoveredChar ch;
-                synchronized (attLock) {
-                    ch = charByValHandle.get(Integer.valueOf(valHandle));
+                synchronized (conn.attLock) {
+                    ch = conn.charByValHandle.get(Integer.valueOf(valHandle));
                 }
-                // Suppress unsolicited notifications outside Service 0xFFF0 (e.g. FW v1.14 emits
-                // 10 Hz notifications on Battery Service 0x180F handle 0x0027 without CCCD write).
-                if (ch == null) {
+                // Suppress unsolicited notifications (e.g., BVM02 FW v1.14 10 Hz Battery Service 0x0027)
+                // unless the client session explicitly enabled notifications on this characteristic.
+                if (ch == null || !ch.notifySubscribed) {
                     return;
                 }
                 byte[] val = new byte[pdu.length - 3];
                 if (val.length > 0) {
                     System.arraycopy(pdu, 3, val, 0, val.length);
                 }
-                LineEmitter em = activeEmitter;
-                if (em != null) {
-                    em.emitLine("CHAR_NOTIFY " + ch.shortUuid + " " + (val.length > 0 ? bytesToHex(val) : "-"));
-                }
+                conn.owner.emitForConn(conn.mac,
+                        "CHAR_NOTIFY " + ch.shortUuid + " " + (val.length > 0 ? bytesToHex(val) : "-"));
             }
             return;
         }
 
-        synchronized (attLock) {
-            if (attAwaitingResponse) {
-                pendingAttResponse = pdu;
-                attLock.notifyAll();
+        synchronized (conn.attLock) {
+            if (conn.attAwaitingResponse) {
+                conn.pendingAttResponse = pdu;
+                conn.attLock.notifyAll();
             }
         }
     }
 
     // ================= PURE STATIC CODECS (HOST-UNIT-TESTABLE) =================
+
+    public static int clampMtu(int mtu) {
+        if (mtu < DEFAULT_ATT_MTU) return DEFAULT_ATT_MTU;
+        if (mtu > MAX_SUPPORTED_ATT_MTU) return MAX_SUPPORTED_ATT_MTU;
+        return mtu;
+    }
 
     public static byte[] buildHciCommandPacket(int opcode, byte[] params) {
         int plen = (params != null) ? params.length : 0;
@@ -1314,6 +2071,51 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
             System.arraycopy(l2capPayload, 0, acl, 8, payLen);
         }
         return acl;
+    }
+
+    /**
+     * Fragments an L2CAP SDU across one or more HCI LE ACL Data Packets respecting the
+     * controller's {@code LE_ACL_Data_Packet_Length} (typically 27 bytes on BT 4.0 controllers).
+     * First packet carries {@code PB=0x00} (start non-auto-flushable), continuation packets carry {@code PB=0x01}.
+     */
+    public static List<byte[]> fragmentL2capIntoAclPackets(
+            int connHandle,
+            int cid,
+            byte[] l2capPayload,
+            int maxAclDataLen) {
+        int effMax = Math.max(8, maxAclDataLen);
+        int payLen = (l2capPayload != null) ? l2capPayload.length : 0;
+        int totalL2cap = 4 + payLen;
+        List<byte[]> out = new ArrayList<byte[]>((totalL2cap + effMax - 1) / effMax);
+
+        if (totalL2cap <= effMax) {
+            out.add(wrapLeAclL2cap(connHandle, cid, l2capPayload));
+            return out;
+        }
+
+        byte[] l2capFrame = new byte[totalL2cap];
+        l2capFrame[0] = (byte) (payLen & 0xFF);
+        l2capFrame[1] = (byte) ((payLen >> 8) & 0xFF);
+        l2capFrame[2] = (byte) (cid & 0xFF);
+        l2capFrame[3] = (byte) ((cid >> 8) & 0xFF);
+        if (payLen > 0) {
+            System.arraycopy(l2capPayload, 0, l2capFrame, 4, payLen);
+        }
+
+        int offset = 0;
+        while (offset < totalL2cap) {
+            int chunkLen = Math.min(effMax, totalL2cap - offset);
+            byte[] acl = new byte[4 + chunkLen];
+            acl[0] = (byte) (connHandle & 0xFF);
+            int pbBits = (offset == 0) ? 0x00 : 0x10; // PB=00 first fragment, PB=01 continuation fragment
+            acl[1] = (byte) (((connHandle >> 8) & 0x0F) | pbBits);
+            acl[2] = (byte) (chunkLen & 0xFF);
+            acl[3] = (byte) ((chunkLen >> 8) & 0xFF);
+            System.arraycopy(l2capFrame, offset, acl, 4, chunkLen);
+            out.add(acl);
+            offset += chunkLen;
+        }
+        return out;
     }
 
     public static List<AdvReportItem> parseLeAdvertisingReports(byte[] hciEvt) {
@@ -1403,8 +2205,7 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
             return String.format(Locale.US, "%04x", Integer.valueOf(u16));
         }
         if (len == 16 && off + 16 <= buf.length) {
-            // Check Bluetooth Base UUID: 0000xxxx-0000-1000-8000-00805f9b34fb (stored little-endian in ATT!)
-            // LE bytes [0..11] = fb 34 9b 5f 80 00 00 80 00 10 00 00, [12..13] = xxxx, [14..15] = 00 00
+            // Check Bluetooth Base UUID: 0000xxxx-0000-1000-8000-00805f9b34fb (stored little-endian in ATT)
             byte[] baseLe = new byte[]{
                     (byte) 0xFB, 0x34, (byte) 0x9B, 0x5F, (byte) 0x80, 0x00,
                     0x00, (byte) 0x80, 0x00, 0x10, 0x00, 0x00
@@ -1496,6 +2297,15 @@ public final class BleGattSessionManager implements BtNativeBridge.PacketSink {
             return out;
         } catch (NumberFormatException e) {
             return null;
+        }
+    }
+
+    private static int parsePositiveInt(String raw, int fallback) {
+        if (raw == null) return fallback;
+        try {
+            return Integer.parseInt(raw.trim());
+        } catch (NumberFormatException nfe) {
+            return fallback;
         }
     }
 

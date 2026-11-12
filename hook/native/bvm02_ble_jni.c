@@ -107,10 +107,18 @@ static fn_gki_getbuf_t g_gki_getbuf = NULL;
 static fn_gki_freebuf_t g_gki_freebuf = NULL;
 static fn_gki_send_msg_t g_gki_send_msg = NULL;
 
+#define MAX_LE_HANDLES            8u
+#define HANDLE_OP_KEEP            (-1)
+#define HANDLE_OP_CLEAR_ALL       (-2)
+#define HANDLE_OP_UNTRACK_FLAG    0x10000
+
 static volatile int g_hook_installed = 0;
 static volatile int g_worker_running = 0;
 static volatile int g_ble_listening = 0;
-static volatile unsigned int g_active_le_handle = INVALID_LE_HANDLE;
+static volatile unsigned int g_le_handles[MAX_LE_HANDLES] = {
+    INVALID_LE_HANDLE, INVALID_LE_HANDLE, INVALID_LE_HANDLE, INVALID_LE_HANDLE,
+    INVALID_LE_HANDLE, INVALID_LE_HANDLE, INVALID_LE_HANDLE, INVALID_LE_HANDLE
+};
 
 static int g_tx_read_fd = -1;
 static int g_rx_write_fd = -1;
@@ -120,6 +128,84 @@ static volatile int g_stat_rx_acl = 0;
 static volatile int g_stat_tx_hci = 0;
 static volatile int g_stat_tx_acl = 0;
 static volatile int g_stat_rx_drop = 0;
+
+static int is_tracked_le_handle(unsigned int h) {
+    unsigned int i;
+    if (h > 0x0EFFu) {
+        return 0;
+    }
+    for (i = 0; i < MAX_LE_HANDLES; i++) {
+        if (g_le_handles[i] == h) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void track_le_handle(unsigned int h) {
+    unsigned int i;
+    if (h > 0x0EFFu) {
+        return;
+    }
+    for (i = 0; i < MAX_LE_HANDLES; i++) {
+        if (g_le_handles[i] == h) {
+            return;
+        }
+    }
+    for (i = 0; i < MAX_LE_HANDLES; i++) {
+        if (g_le_handles[i] == INVALID_LE_HANDLE) {
+            g_le_handles[i] = h;
+            __sync_synchronize();
+            return;
+        }
+    }
+    /* Table full: overwrite last slot as safety fallback */
+    g_le_handles[MAX_LE_HANDLES - 1u] = h;
+    __sync_synchronize();
+}
+
+static void untrack_le_handle(unsigned int h) {
+    unsigned int i;
+    if (h > 0x0EFFu) {
+        return;
+    }
+    for (i = 0; i < MAX_LE_HANDLES; i++) {
+        if (g_le_handles[i] == h) {
+            g_le_handles[i] = INVALID_LE_HANDLE;
+        }
+    }
+    __sync_synchronize();
+}
+
+static void clear_all_le_handles(void) {
+    unsigned int i;
+    for (i = 0; i < MAX_LE_HANDLES; i++) {
+        g_le_handles[i] = INVALID_LE_HANDLE;
+    }
+    __sync_synchronize();
+}
+
+static unsigned int first_tracked_le_handle(void) {
+    unsigned int i;
+    for (i = 0; i < MAX_LE_HANDLES; i++) {
+        unsigned int h = g_le_handles[i];
+        if (h <= 0x0EFFu) {
+            return h;
+        }
+    }
+    return INVALID_LE_HANDLE;
+}
+
+static int count_tracked_le_handles(void) {
+    unsigned int i;
+    int cnt = 0;
+    for (i = 0; i < MAX_LE_HANDLES; i++) {
+        if (g_le_handles[i] <= 0x0EFFu) {
+            cnt++;
+        }
+    }
+    return cnt;
+}
 
 static void emit_rx_frame(uint8_t pkt_type, const uint8_t *payload, uint16_t payload_len) {
     int fd = g_rx_write_fd;
@@ -166,14 +252,13 @@ static int my_data_ind(void *p_transac, char *p_buf, int len) {
 
         /* 1. HCI_BLE_EVENT (0x3E): stock Gen5W bplus.default.so drops 0x3E (BLE_INCLUDED=FALSE) */
         if (ev_code == 0x3Eu) {
-            if (pkt_len >= 6u) {
+            if (pkt_len >= 6u && g_ble_listening) {
                 uint8_t sub = pkt[2];
                 uint8_t status = pkt[3];
                 /* Subevent 0x01 (LE_Connection_Complete) or 0x0A (LE_Enhanced_Connection_Complete) */
                 if ((sub == 0x01u || sub == 0x0Au) && status == 0x00u) {
                     unsigned int h = (unsigned int)pkt[4] | (((unsigned int)(pkt[5] & 0x0Fu)) << 8);
-                    g_active_le_handle = h;
-                    __sync_synchronize();
+                    track_le_handle(h);
                 }
             }
             if (g_ble_listening) {
@@ -192,12 +277,10 @@ static int my_data_ind(void *p_transac, char *p_buf, int len) {
         if ((ev_code == 0x05u && pkt_len >= 6u)
                 || (ev_code == 0x08u && pkt_len >= 5u)
                 || (ev_code == 0x30u && pkt_len >= 5u)) {
-            unsigned int active_h = g_active_le_handle;
             unsigned int ev_h = (unsigned int)pkt[3] | (((unsigned int)(pkt[4] & 0x0Fu)) << 8);
-            if (active_h <= 0x0EFFu && ev_h == active_h) {
+            if (is_tracked_le_handle(ev_h)) {
                 if (ev_code == 0x05u && pkt[2] == 0x00u) {
-                    g_active_le_handle = INVALID_LE_HANDLE;
-                    __sync_synchronize();
+                    untrack_le_handle(ev_h);
                 }
                 g_stat_rx_evt++;
                 emit_rx_frame(RX_TYPE_EVT, pkt, pkt_len);
@@ -212,23 +295,21 @@ static int my_data_ind(void *p_transac, char *p_buf, int len) {
 
         /* 3. Number_Of_Completed_Packets (0x13): protect Classic L2CAP controller_xmit_window */
         if (ev_code == 0x13u && pkt_len >= 3u) {
-            unsigned int active_h = g_active_le_handle;
             uint8_t num_h = pkt[2];
-            if (active_h <= 0x0EFFu && num_h > 0u && (uint16_t)(3u + ((uint16_t)num_h * 4u)) <= pkt_len) {
+            if (num_h > 0u && (uint16_t)(3u + ((uint16_t)num_h * 4u)) <= pkt_len) {
                 uint8_t i;
-                int matched = 0;
+                uint8_t matched_count = 0u;
                 for (i = 0; i < num_h; i++) {
                     uint16_t base = (uint16_t)(3u + ((uint16_t)i * 4u));
                     unsigned int eh = (unsigned int)pkt[base] | (((unsigned int)(pkt[base + 1u] & 0x0Fu)) << 8);
-                    if (eh == active_h) {
-                        matched = 1;
-                        break;
+                    if (is_tracked_le_handle(eh)) {
+                        matched_count++;
                     }
                 }
-                if (matched) {
+                if (matched_count > 0u) {
                     g_stat_rx_evt++;
                     emit_rx_frame(RX_TYPE_EVT, pkt, pkt_len);
-                    if (num_h == 1u) {
+                    if (matched_count == num_h) {
                         if (orig_dealloc != NULL) {
                             orig_dealloc(p_transac, p_buf);
                         } else if (g_gki_freebuf != NULL) {
@@ -236,11 +317,11 @@ static int my_data_ind(void *p_transac, char *p_buf, int len) {
                         }
                         return 0;
                     }
-                    /* Batched Classic + LE credits: zero LE handle's count before forwarding to Bluedroid */
+                    /* Batched Classic + LE credits: zero all tracked LE handle counts before forwarding to Bluedroid */
                     for (i = 0; i < num_h; i++) {
                         uint16_t base = (uint16_t)(3u + ((uint16_t)i * 4u));
                         unsigned int eh = (unsigned int)pkt[base] | (((unsigned int)(pkt[base + 1u] & 0x0Fu)) << 8);
-                        if (eh == active_h) {
+                        if (is_tracked_le_handle(eh)) {
                             pkt[base + 2u] = 0;
                             pkt[base + 3u] = 0;
                         }
@@ -260,19 +341,16 @@ static int my_data_ind(void *p_transac, char *p_buf, int len) {
     }
 
     if (ev_hi == MSG_HC_TO_STACK_HCI_ACL && pkt_len >= 4u) {
-        unsigned int active_h = g_active_le_handle;
-        if (active_h <= 0x0EFFu) {
-            unsigned int acl_h = (unsigned int)pkt[0] | (((unsigned int)(pkt[1] & 0x0Fu)) << 8);
-            if (acl_h == active_h) {
-                g_stat_rx_acl++;
-                emit_rx_frame(RX_TYPE_ACL, pkt, pkt_len);
-                if (orig_dealloc != NULL) {
-                    orig_dealloc(p_transac, p_buf);
-                } else if (g_gki_freebuf != NULL) {
-                    g_gki_freebuf(p_transac);
-                }
-                return 0;
+        unsigned int acl_h = (unsigned int)pkt[0] | (((unsigned int)(pkt[1] & 0x0Fu)) << 8);
+        if (is_tracked_le_handle(acl_h)) {
+            g_stat_rx_acl++;
+            emit_rx_frame(RX_TYPE_ACL, pkt, pkt_len);
+            if (orig_dealloc != NULL) {
+                orig_dealloc(p_transac, p_buf);
+            } else if (g_gki_freebuf != NULL) {
+                g_gki_freebuf(p_transac);
             }
+            return 0;
         }
     }
 
@@ -519,9 +597,15 @@ int Java_bvm02_hook_BtNativeBridge_nativeSetState(void *env, void *clazz, int bl
     (void)clazz;
 
     g_ble_listening = ble_listening ? 1 : 0;
-    g_active_le_handle = (active_le_handle >= 0 && active_le_handle <= 0x0EFF)
-            ? (unsigned int)active_le_handle
-            : INVALID_LE_HANDLE;
+    if (active_le_handle == HANDLE_OP_CLEAR_ALL) {
+        clear_all_le_handles();
+    } else if (active_le_handle == HANDLE_OP_KEEP) {
+        /* Keep existing tracked LE handles intact */
+    } else if (active_le_handle > 0 && (active_le_handle & HANDLE_OP_UNTRACK_FLAG) != 0) {
+        untrack_le_handle((unsigned int)(active_le_handle & 0x0FFF));
+    } else if (active_le_handle >= 0 && active_le_handle <= 0x0EFF) {
+        track_le_handle((unsigned int)active_le_handle);
+    }
     __sync_synchronize();
 
     if (g_ble_listening) {
@@ -545,7 +629,8 @@ int Java_bvm02_hook_BtNativeBridge_nativeGetStat(void *env, void *clazz, int whi
         case 4: return g_stat_tx_hci;
         case 5: return g_stat_tx_acl;
         case 6: return g_stat_rx_drop;
-        case 7: return (int)g_active_le_handle;
+        case 7: return (int)first_tracked_le_handle();
+        case 8: return count_tracked_le_handles();
         default: return -1;
     }
 }
@@ -556,7 +641,7 @@ void Java_bvm02_hook_BtNativeBridge_nativeShutdown(void *env, void *clazz) {
     (void)clazz;
 
     g_ble_listening = 0;
-    g_active_le_handle = INVALID_LE_HANDLE;
+    clear_all_le_handles();
     __sync_synchronize();
 
     if (g_p_bt_hc_cbacks != NULL && *g_p_bt_hc_cbacks == g_my_cbacks && g_orig_cbacks_ptr != NULL) {
@@ -565,3 +650,4 @@ void Java_bvm02_hook_BtNativeBridge_nativeShutdown(void *env, void *clazz) {
     }
     g_hook_installed = 0;
 }
+

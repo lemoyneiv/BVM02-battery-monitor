@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# Strictly read-only, passive Gen5W Bluetooth HAL & process map inspector (v0.2.1).
+# Strictly read-only, passive Gen5W Bluetooth HAL & process map inspector (v0.3.0).
 # Zero writes to /system, /data, or USB; zero /data content or PII/VIN/serial reads.
 
 run_ts="$(date +%s 2>/dev/null)"

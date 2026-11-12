@@ -18,7 +18,7 @@ import java.util.UUID;
  */
 public final class Bvm02Protocol {
 
-    public static final String APP_VERSION = "0.2.1";
+    public static final String APP_VERSION = "0.3.0";
 
     private static final Charset UTF8 = Charset.forName("UTF-8");
 

@@ -8,6 +8,8 @@ import bvm02.hook.BleGattSessionManager;
 import bvm02.hook.BtMemInspector;
 import bvm02.hook.BtNativeBridge;
 import bvm02.hook.Thumb2GetterSim;
+import gen5w.ble.Gen5wBleAdvRecord;
+import gen5w.ble.Gen5wBleClient;
 
 import java.io.ByteArrayOutputStream;
 import java.io.File;
@@ -1075,4 +1077,480 @@ public final class Bvm02UnitTests {
             mgr.onLeAcl(acl2);
         }
     }
+
+    private static void testAttMtuNegotiationFragmentationAndLongReads() throws Exception {
+        // 1. Direct unit check on fragmentL2capIntoAclPackets across 27-byte LE ACL buffers:
+        //    70-byte ATT PDU + 4-byte L2CAP header = 74 bytes -> fragments [27, 27, 20]
+        byte[] dummy70 = new byte[70];
+        for (int i = 0; i < dummy70.length; i++) dummy70[i] = (byte) (i + 1);
+        List<byte[]> frags = BleGattSessionManager.fragmentL2capIntoAclPackets(0x0045, 0x0004, dummy70, 27);
+        assertEquals("74B L2CAP SDU splits into 3 27B ACL packets", 3, frags.size());
+        assertEquals("frag[0] PB=0x00 (start)", 0x00, (frags.get(0)[1] >> 4) & 0x03);
+        assertEquals("frag[0] ACL data len=27", 27, BleGattSessionManager.u16le(frags.get(0), 2));
+        assertEquals("frag[1] PB=0x01 (cont)", 0x01, (frags.get(1)[1] >> 4) & 0x03);
+        assertEquals("frag[1] ACL data len=27", 27, BleGattSessionManager.u16le(frags.get(1), 2));
+        assertEquals("frag[2] PB=0x01 (cont)", 0x01, (frags.get(2)[1] >> 4) & 0x03);
+        assertEquals("frag[2] ACL data len=20", 20, BleGattSessionManager.u16le(frags.get(2), 2));
+
+        // 2. E2E simulated 128-bit Nordic UART peripheral on 27-byte LE ACL buffers with MTU=185 & long read
+        final BleGattSessionManager[] mgrRef = new BleGattSessionManager[1];
+        final List<byte[]> rxCompleteAttPdus = Collections.synchronizedList(new ArrayList<byte[]>());
+        final int[] txAclFragmentsSeen = new int[]{0};
+        final ByteArrayOutputStream controllerTxReasm = new ByteArrayOutputStream();
+        final int[] controllerExpectedLen = new int[]{0};
+
+        // 220-byte synthetic long attribute value
+        final byte[] longAttr220 = new byte[220];
+        for (int i = 0; i < longAttr220.length; i++) longAttr220[i] = (byte) (0xA0 ^ (i & 0xFF));
+
+        BtNativeBridge.Transport mtuTransport = new BtNativeBridge.Transport() {
+            @Override
+            public boolean sendHciCommand(final byte[] hciCmd) {
+                final int opcode = BleGattSessionManager.u16le(hciCmd, 0);
+                Thread t = new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        BleGattSessionManager mgr = mgrRef[0];
+                        if (opcode == BleGattSessionManager.HCI_LE_READ_BUFFER_SIZE) {
+                            // 27-byte LE ACL buffer length, 3 LE buffers
+                            mgr.onHciEvent(new byte[]{
+                                    0x0E, 0x07, 0x01,
+                                    (byte) (opcode & 0xFF), (byte) ((opcode >> 8) & 0xFF),
+                                    0x00, 0x1B, 0x00, 0x03
+                            });
+                        } else if (opcode == BleGattSessionManager.HCI_LE_CREATE_CONNECTION) {
+                            mgr.onHciEvent(new byte[]{
+                                    0x0F, 0x04, 0x00, 0x01,
+                                    (byte) (opcode & 0xFF), (byte) ((opcode >> 8) & 0xFF)
+                            });
+                            byte[] cc = new byte[19];
+                            cc[0] = 0x3E; cc[1] = 17; cc[2] = 0x01; cc[3] = 0x00;
+                            cc[4] = 0x51; cc[5] = 0x00; // handle 0x0051
+                            System.arraycopy(hciCmd, 3 + 6, cc, 8, 6);
+                            mgr.onHciEvent(cc);
+                        } else {
+                            mgr.onHciEvent(new byte[]{
+                                    0x0E, 0x04, 0x01,
+                                    (byte) (opcode & 0xFF), (byte) ((opcode >> 8) & 0xFF), 0x00
+                            });
+                        }
+                    }
+                });
+                t.setDaemon(true);
+                t.start();
+                return true;
+            }
+
+            @Override
+            public boolean sendLeAcl(final byte[] aclPkt) {
+                txAclFragmentsSeen[0]++;
+                Thread t = new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        BleGattSessionManager mgr = mgrRef[0];
+                        int handle = BleGattSessionManager.u16le(aclPkt, 0) & 0x0FFF;
+                        int pb = (aclPkt[1] >> 4) & 0x03;
+                        int aclLen = BleGattSessionManager.u16le(aclPkt, 2);
+
+                        // Replenish 1 LE credit immediately for each fragment
+                        mgr.onHciEvent(new byte[]{
+                                0x13, 0x05, 0x01,
+                                (byte) (handle & 0xFF), (byte) ((handle >> 8) & 0xFF),
+                                0x01, 0x00
+                        });
+
+                        byte[] completeAtt = null;
+                        synchronized (controllerTxReasm) {
+                            if (pb == 0x00) {
+                                int l2capLen = BleGattSessionManager.u16le(aclPkt, 4);
+                                int avail = aclLen - 4;
+                                controllerTxReasm.reset();
+                                controllerTxReasm.write(aclPkt, 8, avail);
+                                controllerExpectedLen[0] = l2capLen;
+                            } else if (pb == 0x01) {
+                                controllerTxReasm.write(aclPkt, 4, aclLen);
+                            }
+                            if (controllerExpectedLen[0] > 0
+                                    && controllerTxReasm.size() >= controllerExpectedLen[0]) {
+                                completeAtt = controllerTxReasm.toByteArray();
+                                controllerTxReasm.reset();
+                                controllerExpectedLen[0] = 0;
+                            }
+                        }
+                        if (completeAtt == null) return;
+
+                        rxCompleteAttPdus.add(completeAtt);
+                        int op = completeAtt[0] & 0xFF;
+
+                        // 128-bit Nordic UART UUIDs (little-endian):
+                        // Service 6e400001-b5a3-f393-e0a9-e50e24dcca9e
+                        byte[] nusSvcLe = new byte[]{
+                                (byte) 0x9E, (byte) 0xCA, (byte) 0xDC, 0x24, 0x0E, (byte) 0xE5, (byte) 0xA9, (byte) 0xE0,
+                                (byte) 0x93, (byte) 0xF3, (byte) 0xA3, (byte) 0xB5, 0x01, 0x00, 0x40, 0x6E
+                        };
+                        byte[] nusTxCharLe = nusSvcLe.clone();
+                        nusTxCharLe[12] = 0x02; // 6e400002-... (Write)
+                        byte[] nusRxCharLe = nusSvcLe.clone();
+                        nusRxCharLe[12] = 0x03; // 6e400003-... (Read/Notify)
+
+                        if (op == BleGattSessionManager.ATT_READ_BY_GROUP_TYPE_REQ) {
+                            int startH = BleGattSessionManager.u16le(completeAtt, 1);
+                            if (startH <= 0x0020) {
+                                byte[] rsp = new byte[2 + 20];
+                                rsp[0] = (byte) BleGattSessionManager.ATT_READ_BY_GROUP_TYPE_RSP;
+                                rsp[1] = 20;
+                                rsp[2] = 0x20; rsp[3] = 0x00;
+                                rsp[4] = 0x28; rsp[5] = 0x00;
+                                System.arraycopy(nusSvcLe, 0, rsp, 6, 16);
+                                sendInboundL2capSingle(mgr, handle, BleGattSessionManager.L2CAP_CID_ATT, rsp);
+                            } else {
+                                sendInboundL2capSingle(mgr, handle, BleGattSessionManager.L2CAP_CID_ATT,
+                                        new byte[]{0x01, 0x10, (byte) startH, (byte) (startH >> 8), 0x0A});
+                            }
+                        } else if (op == BleGattSessionManager.ATT_READ_BY_TYPE_REQ) {
+                            int startH = BleGattSessionManager.u16le(completeAtt, 1);
+                            if (startH <= 0x0021) {
+                                byte[] rsp = new byte[2 + 21];
+                                rsp[0] = (byte) BleGattSessionManager.ATT_READ_BY_TYPE_RSP;
+                                rsp[1] = 21;
+                                rsp[2] = 0x21; rsp[3] = 0x00;
+                                rsp[4] = 0x08; // Write
+                                rsp[5] = 0x22; rsp[6] = 0x00;
+                                System.arraycopy(nusTxCharLe, 0, rsp, 7, 16);
+                                sendInboundL2capSingle(mgr, handle, BleGattSessionManager.L2CAP_CID_ATT, rsp);
+                            } else if (startH <= 0x0023) {
+                                byte[] rsp = new byte[2 + 21];
+                                rsp[0] = (byte) BleGattSessionManager.ATT_READ_BY_TYPE_RSP;
+                                rsp[1] = 21;
+                                rsp[2] = 0x23; rsp[3] = 0x00;
+                                rsp[4] = 0x12; // Read | Notify
+                                rsp[5] = 0x24; rsp[6] = 0x00;
+                                System.arraycopy(nusRxCharLe, 0, rsp, 7, 16);
+                                sendInboundL2capSingle(mgr, handle, BleGattSessionManager.L2CAP_CID_ATT, rsp);
+                            } else {
+                                sendInboundL2capSingle(mgr, handle, BleGattSessionManager.L2CAP_CID_ATT,
+                                        new byte[]{0x01, 0x08, (byte) startH, (byte) (startH >> 8), 0x0A});
+                            }
+                        } else if (op == BleGattSessionManager.ATT_EXCHANGE_MTU_REQ) {
+                            // Negotiate serverRxMtu = 185 (0x00B9)
+                            sendInboundL2capSingle(mgr, handle, BleGattSessionManager.L2CAP_CID_ATT,
+                                    new byte[]{(byte) BleGattSessionManager.ATT_EXCHANGE_MTU_RSP, (byte) 185, 0x00});
+                        } else if (op == BleGattSessionManager.ATT_WRITE_REQ) {
+                            sendInboundL2capSingle(mgr, handle, BleGattSessionManager.L2CAP_CID_ATT,
+                                    new byte[]{(byte) BleGattSessionManager.ATT_WRITE_RSP});
+                        } else if (op == BleGattSessionManager.ATT_READ_REQ) {
+                            // Return first (MTU-1)=184 bytes fragmented inbound across 27-byte chunks
+                            byte[] rsp = new byte[1 + 184];
+                            rsp[0] = (byte) BleGattSessionManager.ATT_READ_RSP;
+                            System.arraycopy(longAttr220, 0, rsp, 1, 184);
+                            sendInboundL2capFragmented(mgr, handle, BleGattSessionManager.L2CAP_CID_ATT, rsp, 23);
+                        } else if (op == BleGattSessionManager.ATT_READ_BLOB_REQ) {
+                            int offset = BleGattSessionManager.u16le(completeAtt, 3);
+                            int rem = Math.max(0, longAttr220.length - offset);
+                            int take = Math.min(184, rem);
+                            byte[] rsp = new byte[1 + take];
+                            rsp[0] = (byte) BleGattSessionManager.ATT_READ_BLOB_RSP;
+                            if (take > 0) System.arraycopy(longAttr220, offset, rsp, 1, take);
+                            sendInboundL2capFragmented(mgr, handle, BleGattSessionManager.L2CAP_CID_ATT, rsp, 20);
+                        }
+                    }
+                });
+                t.setDaemon(true);
+                t.start();
+                return true;
+            }
+
+            @Override
+            public void setFilterState(boolean listening, int activeLeHandle) {}
+        };
+
+        BleGattSessionManager mgr = new BleGattSessionManager(mtuTransport);
+        mgrRef[0] = mgr;
+        final List<String> lines = Collections.synchronizedList(new ArrayList<String>());
+        BleGattSessionManager.ClientSession genericSession = mgr.openDirectSession(
+                new BleGattSessionManager.LineEmitter() {
+                    @Override
+                    public void emitLine(String line) {
+                        lines.add(line);
+                    }
+                }, true);
+
+        // Connect in generic (*) mode to non-BVM02 128-bit UUID peripheral
+        mgr.executeSessionCommand(null, genericSession, "CONNECT CC:11:22:33:44:55 0");
+        boolean ready = false;
+        for (String l : lines) {
+            if (l.startsWith("GATT_READY CC:11:22:33:44:55 ")
+                    && l.contains("6e400002-b5a3-f393-e0a9-e50e24dcca9e:08")
+                    && l.contains("6e400003-b5a3-f393-e0a9-e50e24dcca9e:12")) {
+                ready = true;
+            }
+        }
+        assertTrue("generic 128-bit UUID service discovery succeeded without 0xFFF0", ready);
+
+        // Negotiate ATT MTU (client asks 247, peripheral caps at 185 -> effective 185)
+        lines.clear();
+        mgr.executeSessionCommand(null, genericSession, "REQUEST_MTU 247");
+        assertTrue("REQUEST_MTU negotiated effective MTU 185", lines.contains("OP_OK REQUEST_MTU 185"));
+
+        // Write 64-byte payload (67-byte ATT PDU + 4B L2CAP = 71B -> 3 x 27B LE ACL fragments!)
+        byte[] payload64 = new byte[64];
+        for (int i = 0; i < payload64.length; i++) payload64[i] = (byte) (0x10 + i);
+        int fragsBefore = txAclFragmentsSeen[0];
+        lines.clear();
+        rxCompleteAttPdus.clear();
+        mgr.executeSessionCommand(null, genericSession,
+                "WRITE_CHAR 6e400002-b5a3-f393-e0a9-e50e24dcca9e " + BleGattSessionManager.bytesToHex(payload64));
+        assertTrue("64-byte MTU write succeeded",
+                lines.contains("OP_OK WRITE_CHAR 6e400002-b5a3-f393-e0a9-e50e24dcca9e"));
+        assertEquals("64-byte ATT write fragmented into 3 27B ACL packets", 3, txAclFragmentsSeen[0] - fragsBefore);
+        assertEquals("reassembled ATT Write Request length is 67 bytes", 67, rxCompleteAttPdus.get(0).length);
+
+        // Long characteristic read (184B ATT_READ_RSP + 36B ATT_READ_BLOB_RSP = 220B)
+        lines.clear();
+        mgr.executeSessionCommand(null, genericSession,
+                "READ_LONG_CHAR 6e400003-b5a3-f393-e0a9-e50e24dcca9e");
+        String expectedLongLine = "OP_OK READ_LONG_CHAR 6e400003-b5a3-f393-e0a9-e50e24dcca9e "
+                + BleGattSessionManager.bytesToHex(longAttr220);
+        assertTrue("READ_LONG_CHAR reassembled full 220-byte attribute via 0x0A + 0x0C",
+                lines.contains(expectedLongLine));
+
+        mgr.closeDirectSession(genericSession);
+    }
+
+    private static void testMultiAppAndMultiDeviceConcurrencyAndSdk() throws Exception {
+        // 1. Verify Gen5wBleAdvRecord parses Flags, Complete Name, 16-bit UUID, Service Data, and Manufacturer Data
+        byte[] richAd = new byte[]{
+                0x02, 0x01, 0x06,                                     // Flags = 0x06
+                0x03, 0x03, 0x0D, 0x18,                               // 16-bit UUID 0x180D (Heart Rate)
+                0x05, 0x16, 0x0F, 0x18, 0x58, 0x01,                   // Service Data 0x180F -> {0x58, 0x01}
+                0x05, (byte) 0xFF, 0x59, 0x00, (byte) 0xCA, (byte) 0xFE, // Mfg Data company 0x0059 (Nordic) -> CAFE
+                0x06, 0x09, 'T', 'P', 'M', 'S', '1'                   // Complete Local Name "TPMS1"
+        };
+        Gen5wBleAdvRecord rec = Gen5wBleAdvRecord.parse(richAd);
+        assertEquals("AdvRecord flags", 0x06, rec.flags);
+        assertEqualsStr("AdvRecord localName", "TPMS1", rec.localName);
+        assertTrue("AdvRecord hasServiceUuid 0x180d", rec.hasServiceUuid("0x180D"));
+        byte[] mfg = rec.getManufacturerSpecificData(0x0059);
+        assertTrue("AdvRecord Nordic mfg data present", mfg != null && mfg.length == 2 && (mfg[0] & 0xFF) == 0xCA);
+        byte[] sd = rec.getServiceData("180f");
+        assertTrue("AdvRecord 0x180F service data present", sd != null && sd.length == 2 && (sd[0] & 0xFF) == 0x58);
+
+        // 2. Multi-session + Multi-device E2E test:
+        //    - App A (legacy BVM02 session) connected to BVM02 at AA:00:00:00:00:01 (handle 0x0040)
+        //    - App B (Gen5wBleClient SDK with MULTICONN 1) connected simultaneously to:
+        //        * Peripheral 1 at BB:00:00:00:00:02 (handle 0x0041)
+        //        * Peripheral 2 at BB:00:00:00:00:03 (handle 0x0042)
+        final BleGattSessionManager[] mgrRef = new BleGattSessionManager[1];
+        final List<Integer> filterOps = Collections.synchronizedList(new ArrayList<Integer>());
+
+        BtNativeBridge.Transport multiTransport = new BtNativeBridge.Transport() {
+            @Override
+            public boolean sendHciCommand(final byte[] hciCmd) {
+                final int opcode = BleGattSessionManager.u16le(hciCmd, 0);
+                Thread t = new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        BleGattSessionManager mgr = mgrRef[0];
+                        if (opcode == BleGattSessionManager.HCI_LE_READ_BUFFER_SIZE) {
+                            mgr.onHciEvent(new byte[]{
+                                    0x0E, 0x07, 0x01,
+                                    (byte) (opcode & 0xFF), (byte) ((opcode >> 8) & 0xFF),
+                                    0x00, 0x1B, 0x00, 0x04
+                            });
+                        } else if (opcode == BleGattSessionManager.HCI_LE_CREATE_CONNECTION) {
+                            mgr.onHciEvent(new byte[]{
+                                    0x0F, 0x04, 0x00, 0x01,
+                                    (byte) (opcode & 0xFF), (byte) ((opcode >> 8) & 0xFF)
+                            });
+                            int lastOctet = hciCmd[3 + 6] & 0xFF; // LE[0] = last byte of MAC
+                            int assignedHandle = 0x003F + lastOctet; // :01->0x0040, :02->0x0041, :03->0x0042
+                            byte[] cc = new byte[19];
+                            cc[0] = 0x3E; cc[1] = 17; cc[2] = 0x01; cc[3] = 0x00;
+                            cc[4] = (byte) (assignedHandle & 0xFF);
+                            cc[5] = (byte) ((assignedHandle >> 8) & 0xFF);
+                            System.arraycopy(hciCmd, 3 + 6, cc, 8, 6);
+                            mgr.onHciEvent(cc);
+                        } else {
+                            mgr.onHciEvent(new byte[]{
+                                    0x0E, 0x04, 0x01,
+                                    (byte) (opcode & 0xFF), (byte) ((opcode >> 8) & 0xFF), 0x00
+                            });
+                        }
+                    }
+                });
+                t.setDaemon(true);
+                t.start();
+                return true;
+            }
+
+            @Override
+            public boolean sendLeAcl(final byte[] aclPkt) {
+                Thread t = new Thread(new Runnable() {
+                    @Override
+                    public void run() {
+                        BleGattSessionManager mgr = mgrRef[0];
+                        int handle = BleGattSessionManager.u16le(aclPkt, 0) & 0x0FFF;
+                        int l2capLen = BleGattSessionManager.u16le(aclPkt, 4);
+                        byte[] pdu = new byte[l2capLen];
+                        System.arraycopy(aclPkt, 8, pdu, 0, l2capLen);
+
+                        mgr.onHciEvent(new byte[]{
+                                0x13, 0x05, 0x01,
+                                (byte) (handle & 0xFF), (byte) ((handle >> 8) & 0xFF),
+                                0x01, 0x00
+                        });
+
+                        int op = pdu[0] & 0xFF;
+                        if (op == BleGattSessionManager.ATT_READ_BY_GROUP_TYPE_REQ) {
+                            int startH = BleGattSessionManager.u16le(pdu, 1);
+                            if (startH <= 0x0010) {
+                                // 0x0040 exposes 0xFFF0; 0x0041 & 0x0042 expose Heart Rate 0x180D (no 0xFFF0!)
+                                byte lo = (byte) ((handle == 0x0040) ? 0xF0 : 0x0D);
+                                byte hi = (byte) ((handle == 0x0040) ? 0xFF : 0x18);
+                                sendInboundL2capSingle(mgr, handle, BleGattSessionManager.L2CAP_CID_ATT, new byte[]{
+                                        (byte) BleGattSessionManager.ATT_READ_BY_GROUP_TYPE_RSP, 0x06,
+                                        0x10, 0x00, 0x15, 0x00, lo, hi
+                                });
+                            } else {
+                                sendInboundL2capSingle(mgr, handle, BleGattSessionManager.L2CAP_CID_ATT, new byte[]{
+                                        0x01, 0x10, (byte) startH, (byte) (startH >> 8), 0x0A
+                                });
+                            }
+                        } else if (op == BleGattSessionManager.ATT_READ_BY_TYPE_REQ) {
+                            int startH = BleGattSessionManager.u16le(pdu, 1);
+                            if (startH <= 0x0011) {
+                                byte lo = (byte) ((handle == 0x0040) ? 0xF4 : 0x37); // fff4 vs 2a37
+                                byte hi = (byte) ((handle == 0x0040) ? 0xFF : 0x2A);
+                                sendInboundL2capSingle(mgr, handle, BleGattSessionManager.L2CAP_CID_ATT, new byte[]{
+                                        (byte) BleGattSessionManager.ATT_READ_BY_TYPE_RSP, 0x07,
+                                        0x11, 0x00, 0x12, 0x12, 0x00, lo, hi
+                                });
+                            } else {
+                                sendInboundL2capSingle(mgr, handle, BleGattSessionManager.L2CAP_CID_ATT, new byte[]{
+                                        0x01, 0x08, (byte) startH, (byte) (startH >> 8), 0x0A
+                                });
+                            }
+                        } else if (op == BleGattSessionManager.ATT_FIND_INFO_REQ) {
+                            sendInboundL2capSingle(mgr, handle, BleGattSessionManager.L2CAP_CID_ATT, new byte[]{
+                                    (byte) BleGattSessionManager.ATT_FIND_INFO_RSP, 0x01,
+                                    0x13, 0x00, 0x02, 0x29
+                            });
+                        } else if (op == BleGattSessionManager.ATT_WRITE_REQ) {
+                            sendInboundL2capSingle(mgr, handle, BleGattSessionManager.L2CAP_CID_ATT, new byte[]{
+                                    (byte) BleGattSessionManager.ATT_WRITE_RSP
+                            });
+                        }
+                    }
+                });
+                t.setDaemon(true);
+                t.start();
+                return true;
+            }
+
+            @Override
+            public void setFilterState(boolean listening, int activeLeHandle) {
+                filterOps.add(Integer.valueOf(activeLeHandle));
+            }
+        };
+
+        final BleGattSessionManager mgr = new BleGattSessionManager(multiTransport);
+        mgrRef[0] = mgr;
+
+        // App A: BVM02 session
+        final List<String> appALines = Collections.synchronizedList(new ArrayList<String>());
+        final BleGattSessionManager.ClientSession sessA = mgr.openDirectSession(
+                new BleGattSessionManager.LineEmitter() {
+                    @Override
+                    public void emitLine(String line) {
+                        appALines.add(line);
+                    }
+                }, false);
+
+        // App B: Gen5wBleClient SDK with MULTICONN 1
+        final List<String> connectedSdkMacs = Collections.synchronizedList(new ArrayList<String>());
+        final Map<String, byte[]> sdkNotifies = Collections.synchronizedMap(new HashMap<String, byte[]>());
+        final Gen5wBleClient[] sdkRef = new Gen5wBleClient[1];
+        final BleGattSessionManager.ClientSession sessB = mgr.openDirectSession(
+                new BleGattSessionManager.LineEmitter() {
+                    @Override
+                    public void emitLine(String line) {
+                        if (sdkRef[0] != null) sdkRef[0].handleServerLine(line);
+                    }
+                }, true);
+
+        Gen5wBleClient sdk = new Gen5wBleClient(new Gen5wBleClient.SimpleListener() {
+            @Override
+            public void onConnected(String mac, Map<String, Integer> charPropsByUuid) {
+                connectedSdkMacs.add(mac);
+            }
+
+            @Override
+            public void onCharacteristicChanged(String mac, String uuid, byte[] value) {
+                sdkNotifies.put(mac + ":" + uuid, value);
+            }
+        });
+        sdkRef[0] = sdk;
+        sdk.attachCustomChannel(new Gen5wBleClient.LineChannel() {
+            @Override
+            public void sendLine(String line) {
+                if (!"QUIT".equals(line)) {
+                    mgr.executeSessionCommand(null, sessB, line);
+                }
+            }
+
+            @Override
+            public void close() {
+                mgr.closeDirectSession(sessB);
+            }
+        });
+
+        // Connect all 3 BLE devices across the 2 apps!
+        mgr.executeSessionCommand(null, sessA, "CONNECT AA:00:00:00:00:01 0");
+        mgr.executeSessionCommand(null, sessA, "ENABLE_NOTIFY fff4");
+
+        sdk.connectDevice("BB:00:00:00:00:02", 0, "*");
+        sdk.enableNotifications("BB:00:00:00:00:02", "2a37");
+
+        sdk.connectDevice("BB:00:00:00:00:03", 0, "*");
+        sdk.enableNotifications("BB:00:00:00:00:03", "2a37");
+
+        assertEquals("Gen5wBleClient connected 2 simultaneous devices", 2, connectedSdkMacs.size());
+        assertTrue("describeActiveSessions shows 3 active connections",
+                mgr.describeActiveSessions().contains("connections=3/4"));
+
+        // Inject simultaneous notifications on all 3 handles (0x0040, 0x0041, 0x0042)
+        appALines.clear();
+        sendInboundL2capSingle(mgr, 0x0040, BleGattSessionManager.L2CAP_CID_ATT, new byte[]{
+                (byte) BleGattSessionManager.ATT_HANDLE_VALUE_NTF, 0x12, 0x00, 0x11, 0x22
+        });
+        sendInboundL2capSingle(mgr, 0x0041, BleGattSessionManager.L2CAP_CID_ATT, new byte[]{
+                (byte) BleGattSessionManager.ATT_HANDLE_VALUE_NTF, 0x12, 0x00, 0x00, 0x48
+        });
+        sendInboundL2capSingle(mgr, 0x0042, BleGattSessionManager.L2CAP_CID_ATT, new byte[]{
+                (byte) BleGattSessionManager.ATT_HANDLE_VALUE_NTF, 0x12, 0x00, 0x00, 0x5A
+        });
+
+        assertEquals("App A received only its unprefixed BVM02 notification", 1, appALines.size());
+        assertEqualsStr("App A BVM02 notify line", "CHAR_NOTIFY fff4 1122", appALines.get(0));
+        assertTrue("App B SDK received notify from BB:...02",
+                sdkNotifies.containsKey("BB:00:00:00:00:02:2a37")
+                        && (sdkNotifies.get("BB:00:00:00:00:02:2a37")[1] & 0xFF) == 0x48);
+        assertTrue("App B SDK received notify from BB:...03",
+                sdkNotifies.containsKey("BB:00:00:00:00:03:2a37")
+                        && (sdkNotifies.get("BB:00:00:00:00:03:2a37")[1] & 0xFF) == 0x5A);
+
+        // Disconnect ONLY BB:00:00:00:00:02 (0x0041) -> verify 0x0040 and 0x0042 stay alive!
+        filterOps.clear();
+        sdk.disconnectDevice("BB:00:00:00:00:02");
+        assertTrue("untracked only handle 0x0041",
+                filterOps.contains(Integer.valueOf(BtNativeBridge.encodeUntrackHandle(0x0041))));
+        assertTrue("2 connections remain active (0x0040 & 0x0042)",
+                mgr.describeActiveSessions().contains("connections=2/4"));
+
+        sdk.close();
+        mgr.closeDirectSession(sessA);
+        assertTrue("0 connections remain after both sessions close",
+                mgr.describeActiveSessions().contains("connections=0/4"));
+    }
 }
+

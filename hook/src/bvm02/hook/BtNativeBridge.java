@@ -156,6 +156,14 @@ public final class BtNativeBridge {
         }
     }
 
+    public static final int HANDLE_OP_KEEP = -1;
+    public static final int HANDLE_OP_CLEAR_ALL = -2;
+    public static final int HANDLE_OP_UNTRACK_FLAG = 0x10000;
+
+    public static int encodeUntrackHandle(int handle) {
+        return HANDLE_OP_UNTRACK_FLAG | (handle & 0x0FFF);
+    }
+
     public static void shutdown() {
         if (!soLoaded) return;
         try {
@@ -173,6 +181,7 @@ public final class BtNativeBridge {
         int txAcl = -1;
         int rxDrop = -1;
         int activeHandle = 0xFFFF;
+        int activeHandleCount = 0;
         if (soLoaded) {
             try {
                 hookInstalled = nativeGetStat(0);
@@ -183,14 +192,16 @@ public final class BtNativeBridge {
                 txAcl = nativeGetStat(5);
                 rxDrop = nativeGetStat(6);
                 activeHandle = nativeGetStat(7);
+                activeHandleCount = nativeGetStat(8);
             } catch (Throwable ignored) {}
         }
         return String.format(Locale.US,
-                "ready=%s soLoaded=%s path=%s initRc=%d err=%s hookInstalled=%d worker=%d activeHandle=0x%04x txHci=%d txAcl=%d rxEvt=%d rxAcl=%d rxDrop=%d",
+                "ready=%s soLoaded=%s path=%s initRc=%d err=%s hookInstalled=%d worker=%d activeHandle=0x%04x activeHandles=%d txHci=%d txAcl=%d rxEvt=%d rxAcl=%d rxDrop=%d",
                 Boolean.valueOf(ok), Boolean.valueOf(soLoaded), loadedSoPath,
                 Integer.valueOf(lastInitRc), lastInitError,
                 Integer.valueOf(hookInstalled), Integer.valueOf(workerAlive),
                 Integer.valueOf(activeHandle & 0xFFFF),
+                Integer.valueOf(Math.max(0, activeHandleCount)),
                 Integer.valueOf(txHci), Integer.valueOf(txAcl),
                 Integer.valueOf(rxEvt), Integer.valueOf(rxAcl), Integer.valueOf(rxDrop));
     }
@@ -268,17 +279,25 @@ public final class BtNativeBridge {
     }
 
     private static File locateNativeLibrary(LoadedApp app) {
+        String[] hostPackages = {"bvm02.app", "gen5w.ble.service"};
+        String[] soNames = {"libbvm02_ble.so", "libgen5w_ble.so"};
         Context ctx = resolveContext(app);
         if (ctx != null) {
             try {
                 PackageManager pm = ctx.getPackageManager();
                 if (pm != null) {
-                    ApplicationInfo ai = pm.getApplicationInfo("bvm02.app", 0);
-                    if (ai != null && ai.nativeLibraryDir != null) {
-                        File cand = new File(ai.nativeLibraryDir, "libbvm02_ble.so");
-                        if (cand.isFile()) {
-                            return cand;
-                        }
+                    for (int p = 0; p < hostPackages.length; p++) {
+                        try {
+                            ApplicationInfo ai = pm.getApplicationInfo(hostPackages[p], 0);
+                            if (ai != null && ai.nativeLibraryDir != null) {
+                                for (int s = 0; s < soNames.length; s++) {
+                                    File cand = new File(ai.nativeLibraryDir, soNames[s]);
+                                    if (cand.isFile()) {
+                                        return cand;
+                                    }
+                                }
+                            }
+                        } catch (Throwable ignored) {}
                     }
                 }
             } catch (Throwable ignored) {}
@@ -288,14 +307,34 @@ public final class BtNativeBridge {
                 "/data/app-lib/bvm02.app-1",
                 "/data/app-lib/bvm02.app-2",
                 "/data/app-lib/bvm02.app-3",
-                "/data/app-lib/bvm02.app"
+                "/data/app-lib/bvm02.app",
+                "/data/app-lib/gen5w.ble.service-1",
+                "/data/app-lib/gen5w.ble.service-2"
         };
         for (int i = 0; i < fallbackDirs.length; i++) {
-            File cand = new File(fallbackDirs[i], "libbvm02_ble.so");
-            if (cand.isFile()) {
-                return cand;
+            for (int s = 0; s < soNames.length; s++) {
+                File cand = new File(fallbackDirs[i], soNames[s]);
+                if (cand.isFile()) {
+                    return cand;
+                }
             }
         }
+        try {
+            File appLibRoot = new File("/data/app-lib");
+            File[] dirs = appLibRoot.listFiles();
+            if (dirs != null) {
+                for (int i = 0; i < dirs.length; i++) {
+                    if (dirs[i] != null && dirs[i].isDirectory()) {
+                        for (int s = 0; s < soNames.length; s++) {
+                            File cand = new File(dirs[i], soNames[s]);
+                            if (cand.isFile()) {
+                                return cand;
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (Throwable ignored) {}
         return null;
     }
 

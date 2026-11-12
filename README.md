@@ -14,12 +14,13 @@ The LNEX BVM02 battery monitor's original companion Android app (`BatterySense` 
 
 ---
 
-## Current Scope — `v0.2.1` Direct HCI LE & ATT Central Release
+## Current Scope — `v0.3.0` General-Purpose Multi-Client BLE & MTU Release
 
 * **24:9 Automotive Widescreen UI:** Left driver-side navigation sidebar, high-contrast dark theme, and large touch targets tailored for `1920x720` Gen5W screens.
-* **Coexistence-Safe Direct HCI LE & ATT/GATT Central Bridge (`@bvm02_ble` + `libbvm02_ble.so`):**
+* **General-Purpose Multi-Client HCI LE & ATT/GATT Central Bridge (`@gen5w_ble` + `@bvm02_ble` + `libbvm02_ble.so`):**
   * Stock Gen5W Telechips `tcc.solution.bluetooth.mbox=1` firmware compiles `bplus.default.so` with `BLE_INCLUDED=FALSE` and disables `GattService`, even though the on-board Broadcom Bluetooth 4.x controller supports full simultaneous `BR/EDR + LE` (`HCI 0x2001..0x2013`).
-  * `v0.2.1` embeds a lightweight ARMv7 JNI bridge (`libbvm02_ble.so`) + ATT/GATT Central (`BleGattSessionManager`) strictly inside `com.android.bluetooth` (`hooks.jar` / `bvm02.hook.BtHookEntry`) over the abstract UNIX socket `@bvm02_ble`, while automatically using standard `BluetoothAdapter.startLeScan` / `BluetoothDevice.connectGatt` on firmware where `IBluetoothGatt` is present.
+  * `v0.3.0` embeds a multi-handle ARMv7 JNI bridge (`libbvm02_ble.so`) + general-purpose ATT/GATT Central (`BleGattSessionManager`) strictly inside `com.android.bluetooth` (`hooks.jar` / `bvm02.hook.BtHookEntry`), exposing both `@gen5w_ble` (wildcard GATT discovery for any Gen5W BLE project) and `@bvm02_ble` (BVM02 defaults), plus a standalone zero-dependency SDK (`dist/gen5w-ble-client-v0.3.0.jar` — see [GEN5W_BLE_LIBRARY.md](GEN5W_BLE_LIBRARY.md)).
+  * Supports **multiple simultaneous BLE connections** (up to 4 concurrent peripherals across multiple apps or within a single app via `MULTICONN 1`), **ATT MTU negotiation (`23..517` bytes)** with automatic outbound LE ACL fragmentation across 27-byte BT 4.0 controller buffers, and **ATT long characteristic reads** (`READ_BLOB` / `READ_LONG_CHAR`).
   * Preserves 100% of simultaneous Classic Bluetooth (`HFP` phone calls, `A2DP` audio streaming, and L2CAP credit flow control) and keeps `system_server` completely untouched.
   * Supports both active BLE scanning (`ADV_IND` + `SCAN_RSP` AD merging) and **`Add by MAC`** (`AA:BB:CC:DD:EE:FF`, auto-probing Public & Random LE address types).
 * **Live Battery Telemetry (`UUID 0xFFF2` @ 1.5s):**
@@ -32,7 +33,7 @@ The LNEX BVM02 battery monitor's original companion Android app (`BatterySense` 
   * Export `.txt` BLE diagnostic logs and `.csv` voltage time-series to `<usb>/BVM02Logs/` on any FAT32/exFAT USB stick.
   * Tap the top-left **BVM02** header with a USB stick inserted to save a `1920x720` PNG screenshot to `<usb>/BVM02Logs/` (automatically correcting Telechips `BGRA` channel ordering).
 
-### Roadmap (Phase 2 — Post On-Car BLE Verification)
+### Roadmap (Phase 2 — Extended BVM02 Diagnostics)
 
 All underlying command opcodes and payload layouts are already documented in [PROTOCOL.md](PROTOCOL.md):
 * **Cranking / Starting System Test (`Cmd 0x03` & Async `0x20`):** High-speed starter voltage dip waveform capture & health grading.
@@ -43,14 +44,15 @@ All underlying command opcodes and payload layouts are already documented in [PR
 
 ## Installation on Gen5W
 
-Build artifacts are generated in `dist/` in four formats:
+Build artifacts are generated in `dist/`:
 
 | Package Archive | Target Environment |
 | :--- | :--- |
-| `bvm02-gen5w-v0.2.1-hmgapi-usb.zip` | **HMG-API Auto-Installer:** Extract directly onto the root of a FAT32 USB flash drive (`HMGAPI/updates/bvm02-gen5w-v0.2.1.zip`) and insert into the vehicle's data USB port. |
-| `bvm02-gen5w-v0.2.1.hmgapi.zip` | **HMG-API Mod Archive:** Direct `.hmgapi.zip` package signed with ECDSA P-256 (`META-HMGAPI/signature`). |
-| `bvm02-gen5w-v0.2.1-nemesis-usb.zip` | **NEMESIS USB Sideload:** Extract onto a FAT32 USB drive (`nemesis/apps/...`) for NEMESIS Manager installation. |
-| `bvm02-gen5w-v0.2.1-nemesis-package.zip` | **NEMESIS Store Repository Package.** |
+| `bvm02-gen5w-v0.3.0-hmgapi-usb.zip` | **HMG-API Auto-Installer:** Extract directly onto the root of a FAT32 USB flash drive (`HMGAPI/updates/bvm02-gen5w-v0.3.0.zip`) and insert into the vehicle's data USB port. |
+| `bvm02-gen5w-v0.3.0.hmgapi.zip` | **HMG-API Mod Archive:** Direct `.hmgapi.zip` package signed with ECDSA P-256 (`META-HMGAPI/signature`). |
+| `bvm02-gen5w-v0.3.0-nemesis-usb.zip` | **NEMESIS USB Sideload:** Extract onto a FAT32 USB drive (`nemesis/apps/...`) for NEMESIS Manager installation. |
+| `bvm02-gen5w-v0.3.0-nemesis-package.zip` | **NEMESIS Store Repository Package.** |
+| `gen5w-ble-client-v0.3.0.jar` | **Standalone Gen5W BLE Client SDK JAR** (`gen5w.ble.*`, API 19, zero BVM02 dependencies) for third-party Gen5W apps. |
 
 ### Manual ADB Install (Bench / Engineering Mode)
 

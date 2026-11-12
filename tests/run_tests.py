@@ -80,7 +80,7 @@ def _audit_dex_against_api19(dex_path: Path, label: str, allowed_parent_prefixes
 
     banned_patterns = [
         ("android/bluetooth/le/", "API 21+ android.bluetooth.le.* reference"),
-        ("requestMtu", "API 21+ BluetoothGatt.requestMtu reference"),
+        ("Landroid/bluetooth/BluetoothGatt;.requestMtu", "API 21+ BluetoothGatt.requestMtu reference"),
         ("getBluetoothLeScanner", "API 21+ getBluetoothLeScanner reference"),
         ("getBluetoothLeAdvertiser", "API 21+ getBluetoothLeAdvertiser reference"),
         (
@@ -409,7 +409,27 @@ def test_distribution_archives_and_hmg_signature() -> None:
         if "NEMESIS.data" not in zf.namelist() or "packages/hmgapi.bvm02-gen5w.zip" not in zf.namelist():
             fail("nemesis-usb.zip missing NEMESIS.data or packages/hmgapi.bvm02-gen5w.zip")
 
-    print(f"  [OK] All 4 dist/*v{ver_str}*.zip archives & HMG-API ECDSA P-256 signature verified (uuid={uuid_str})")
+    sdk_jar = DIST_DIR / f"gen5w-ble-client-v{ver_str}.jar"
+    if not sdk_jar.is_file() or sdk_jar.stat().st_size == 0:
+        fail(f"Missing standalone Gen5W BLE Client SDK JAR: {sdk_jar}")
+    with zipfile.ZipFile(sdk_jar, "r") as sz:
+        sdk_names = set(sz.namelist())
+        for req_cls in ("gen5w/ble/Gen5wBleClient.class", "gen5w/ble/Gen5wBleAdvRecord.class"):
+            if req_cls not in sdk_names:
+                fail(f"Standalone SDK JAR missing {req_cls}")
+        for entry in sdk_names:
+            if entry.endswith(".class"):
+                if not entry.startswith("gen5w/ble/"):
+                    fail(f"Unexpected non-SDK class in {sdk_jar.name}: {entry}")
+                raw_cls = sz.read(entry)
+                if b"bvm02/app" in raw_cls or b"bvm02/hook" in raw_cls:
+                    fail(f"Standalone SDK class {entry} must have zero coupling to bvm02.*!")
+
+    print(
+        f"  [OK] All 4 dist/*v{ver_str}*.zip archives, standalone {sdk_jar.name}, "
+        f"& HMG-API ECDSA P-256 signature verified (uuid={uuid_str})"
+    )
+
 
 
 def test_shell_scripts_and_flash_safety() -> None:

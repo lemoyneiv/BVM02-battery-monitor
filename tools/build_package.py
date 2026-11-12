@@ -393,6 +393,24 @@ import sign  # noqa: E402
 
 for old_pkg in glob.glob(os.path.join(DIST_DIR, "bvm02-gen5w-v*.zip")):
     os.remove(old_pkg)
+for old_sdk in glob.glob(os.path.join(DIST_DIR, "gen5w-ble-client-v*.jar")):
+    os.remove(old_sdk)
+
+import json  # noqa: E402
+with open(os.path.join(BASE_DIR, "mod", "mod.json"), "r", encoding="utf-8") as mf:
+    mod_ver = json.load(mf)["version"]
+
+sdk_jar = os.path.join(DIST_DIR, f"gen5w-ble-client-v{mod_ver}.jar")
+sdk_classes_root = os.path.join(BUILD_DIR, "classes")
+with zipfile.ZipFile(sdk_jar, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as sz:
+    sz.writestr("META-INF/MANIFEST.MF", f"Manifest-Version: 1.0\r\nImplementation-Title: Gen5W BLE Client SDK\r\nImplementation-Version: {mod_ver}\r\n\r\n")
+    for root, _, files in os.walk(os.path.join(sdk_classes_root, "gen5w", "ble")):
+        for f in sorted(files):
+            if f.endswith(".class"):
+                abs_f = os.path.join(root, f)
+                rel_f = os.path.relpath(abs_f, sdk_classes_root).replace(os.sep, "/")
+                sz.write(abs_f, rel_f)
+print(f"  Packaged standalone SDK JAR: gen5w-ble-client-v{mod_ver}.jar ({os.path.getsize(sdk_jar)} bytes)")
 
 hmgapi_candidates = [
     os.environ.get("HMGAPI_DIR", ""),
@@ -409,3 +427,4 @@ print("Generated packages in:", DIST_DIR)
 for f in sorted(os.listdir(DIST_DIR)):
     p = os.path.join(DIST_DIR, f)
     print(f"  {f} ({os.path.getsize(p):,} bytes)")
+
